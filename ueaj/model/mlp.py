@@ -8,7 +8,7 @@ from flax.nnx import rnglib as rng
 from ueaj.model import ueajsum as us
 from ueaj.utils.argutils import either
 from ueaj.utils.collections import LOW_PRECISION
-from ueaj.utils.gradutils import debug_dtype
+from ueaj.utils.gradutils import debug_dtype, custom_grad_vectors
 from jax.ad_checkpoint import checkpoint_name
 
 @dataclass
@@ -37,12 +37,21 @@ class MLPConfig:
 		return either(self._gate_config, self.param_config)
 
 	def with_gate(self, config: us.ParamConfig):
+		# Check for redundancy - if config is same as param_config, raise error
+		if config == self.param_config:
+			raise ValueError("Redundant specification: gate_config is same as param_config")
 		return replace(self, _gate_config=config)
 
 	def with_up(self, config: us.ParamConfig):
+		# Check for redundancy - if config is same as param_config, raise error
+		if config == self.param_config:
+			raise ValueError("Redundant specification: up_config is same as param_config")
 		return replace(self, _up_config=config)
 
 	def with_down(self, config: us.ParamConfig):
+		# Check for redundancy - if config is same as param_config with zeros init, raise error
+		if config == self.param_config.with_initializer(nnx.initializers.zeros):
+			raise ValueError("Redundant specification: down_config is same as param_config with zeros initializer")
 		return replace(self, _down_config=config)
 
 	def with_param(self, config: us.ParamConfig):
@@ -56,10 +65,10 @@ class MLP(nnx.Module):
 
 		make_ueajsum = lambda c: us.Ueajsum(c, size_dict, rngs=rngs)
 		self.up_proj = make_ueajsum(
-			us.parse("bnd,*dh->bnh").param(config.up_config)
+			us.parse("bnd,*dh->bnh").param(config.up_config).in_axes_zero()
 		)
 		self.down_proj = make_ueajsum(
-			us.parse("bnh,*hd->bnd").param(config.down_config)
+			us.parse("bnh,*hd->bnd").param(config.down_config).in_axes_zero()
 		)
 
 		self.activation_fn = config.activation_fn
@@ -85,11 +94,11 @@ class GMLP(nnx.Module):
 
 		make_ueajsum = lambda c: us.Ueajsum(c, size_dict, rngs=rngs)
 		self.fused_proj = make_ueajsum(
-			us.parse("bnd,*idh->ibnh").param(config.up_config)
+			us.parse("bnd,*idh->ibnh").param(config.up_config).in_axes({1: (1,)}).batch_axes({1: (0,)})
 		)
 
 		self.down_proj = make_ueajsum(
-			us.parse("bnh,bnh,*hd->bnd").param(config.down_config)
+			us.parse("bnh,bnh,*hd->bnd").param(config.down_config).in_axes_zero()
 		)
 		self.activation_fn = config.activation_fn
 
@@ -108,34 +117,47 @@ class GMLP(nnx.Module):
 
 		return x
 
-	# todo manual backprop implementation
 
-# from ueaj.model import RMSNorm
-# def bwd(mlp: GMLP, x: jax.Array, dx: jax.Array, rms: 'RMSNorm' | None = None):
-# 	x2 = rms(x) if rms else x
-#
-# 	fused = mlp.fused_proj(x2)
-# 	up, gate = fused
-#
-# 	if x.dtype not in LOW_PRECISION:
-# 		gx = up * mlp.activation_fn(gate)
-# 	else:
-# 		s = jnp.max(jnp.abs(up), axis=(0, 1), keepdims=True) + 1
-# 		gx = (s * up) * mlp.activation_fn(gate)
-# 		gx = x / s
-#
-# 	del up
-# 	dmlp, (dgx) = mlp.down_proj.parse_and_bwd("bnh,[1]->bnd", gx)
-#
-# 	del gx
-#
-# 	gate_a = mlp.activation_fn(gate)
-# 	dup = dgx * gate_a
-#
-# 	# todo unfused transpose
-#
-#
-# 	return x
+class BMLP(nnx.Module):
+	"""Bayesian MLP with mean and variance projections"""
+	def __init__(self, config: MLPConfig, rngs: rng.Rngs):
+		super().__init__()
+		size_dict = {'d': config.model_d, 'h': config.hidden_d}
+		
+		make_ueajsum = lambda c: us.Ueajsum(c, size_dict, rngs=rngs)
+		
+		# Up projection for mean
+		self.up_proj = make_ueajsum(
+			us.parse("bnd,*dh->bnh").param(config.up_config).in_axes_zero()
+		)
+		
+		# Variance projection - uses gate_config for custom learning rate
+		self.var_proj = make_ueajsum(
+			us.parse("bnd,*dh->bnh").param(config.gate_config).in_axes_zero()
+		)
+		
+		# Down projection
+		self.down_proj = make_ueajsum(
+			us.parse("bnh,*hd->bnd").param(config.down_config).in_axes_zero()
+		)
+		
+		self.activation_fn = config.activation_fn
+		self.var_lr = .1  # Learning rate multiplier for variance
+	
+	def __call__(self, x):
+		# Project to get mean and variance
+		mean = self.up_proj(x)
+
+		var = self.var_proj(x)
+		var = nnx.softplus(var)
+		
+		h = custom_grad_vectors(mean, var, self.var_lr)
+		
+		h = self.activation_fn(h)
+		
+		x = self.down_proj(h)
+		return x
+
 
 if __name__ == "__main__":
 	config = MLPConfig(
@@ -147,6 +169,9 @@ if __name__ == "__main__":
 	m = MLP(config.with_down(config.param_config.with_initializer(nnx.initializers.lecun_normal())), rngs=rng.Rngs(0))
 	gm = GMLP(config.with_down(config.param_config.with_initializer(nnx.initializers.lecun_normal())),
 		rngs=rng.Rngs(0))
+	bm = BMLP(config.with_down(config.param_config.with_initializer(nnx.initializers.lecun_normal())),
+		rngs=rng.Rngs(0))
 
 	print(m(x))
 	print(gm(x))
+	print(bm(x))

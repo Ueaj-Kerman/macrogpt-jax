@@ -1,5 +1,7 @@
 import itertools
-from typing import Sequence, Mapping
+import operator
+from functools import reduce
+from typing import Sequence, Mapping, Any
 
 import jax
 # todo ueajsum to einsum translation
@@ -8,17 +10,22 @@ import jax
 #	3. update mixsum and varsum
 
 from flax import nnx
+from flax.core import FrozenDict
 from flax.nnx import rnglib as rng
+from jax import numpy as jnp
 
 from ueaj.model.ueajsum import config as cfg
 from ueaj.model.ueajsum import parser
 from ueaj.model.ueajsum.mixsum import mixsum
+from ueaj.utils import either
+
 
 class Ueajsum(nnx.Module):
 	def __init__(self, config: cfg.UeajsumConfig, shape_map: Mapping[str, int], rngs: rng.Rngs):
 		super().__init__()
 
 		self.config = config
+		self.shape_map = FrozenDict(shape_map)
 
 		for k, v in config.kwarg_configs.items():
 			if isinstance(v, cfg.ParamConfig):
@@ -31,7 +38,6 @@ class Ueajsum(nnx.Module):
 				shape = tuple(map(lambda x: shape_map[x], v.shape))
 				tensor = v.group(v.initializer(key=rngs.params(), shape=shape).astype(v.dtype))
 				setattr(self, f"w_{i}", tensor)
-
 
 	def __call__(self, *args, **kwargs):
 		return self.invoke(self.config, False, *args, **kwargs)
@@ -86,47 +92,6 @@ class Ueajsum(nnx.Module):
 
 		return accumulator
 
-	def get_argument_axes_info(self, terms: cfg.UeajsumConfig = None):
-		"""
-		Determines the reducing and non-reducing axes for each argument
-		based on a Ueajsum configuration.
-
-		Args:
-			terms: A UeajsumConfig object. If None, `self.config` is used.
-
-		Returns:
-			A dictionary mapping each argument identifier (int for positional,
-			str for keyword) to a dictionary containing:
-			- 'reducing_axes': A sorted list of axes that are reduced.
-			- 'non_reducing_axes': A sorted list of axes that are not reduced.
-		"""
-		if terms is None:
-			terms = self.config
-
-		arg_configs = {}
-		for i, term_config in enumerate(terms.arg_configs):
-			if term_config:
-				arg_configs[i] = term_config
-		for k, term_config in terms.kwarg_configs.items():
-			if term_config:
-				arg_configs[k] = term_config
-
-		output_axes = set(terms.result_config.shape)
-		axes_info = {}
-
-		for arg_ref, arg_config in arg_configs.items():
-			arg_shape_axes = set(arg_config.shape)
-			
-			non_reducing = arg_shape_axes.intersection(output_axes)
-			reducing = arg_shape_axes.difference(output_axes)
-
-			axes_info[arg_ref] = {
-				'reducing_axes': reducing,
-				'non_reducing_axes': non_reducing,
-			}
-			
-		return axes_info
-
 	def _default_arg_dict(self, pairs: bool = True):
 		arg_dict = {}
 
@@ -168,3 +133,128 @@ class Ueajsum(nnx.Module):
 				arg_dict[k] = (entry[0], v)
 
 		return arg_dict
+
+	def map_state(self, state: nnx.State | Mapping[str, Any], from_optimizer: bool = False):
+		"""
+		Maps parameter tensors to/from optimizer format by reshaping:
+		- If from_optimizer=False: reshape to (reducing_dims, batch_dims)
+		- If from_optimizer=True: reshape back to original shape
+		
+		Uses simple transpose + reshape operations with argsort for inverse.
+		"""
+		import numpy as np
+		
+		state = nnx.State(state) if not isinstance(state, nnx.State) else state
+		
+		# Process each parameter
+		for k, v in itertools.chain(enumerate(self.config.arg_configs), self.config.kwarg_configs.items()):
+			if not isinstance(v, cfg.ParamConfig):
+				continue
+			if v.in_axes is None:
+				continue
+
+			# Determine the key in state
+			state_key = f"w_{k}" if isinstance(k, int) else k
+			if state_key not in state:
+				continue
+
+			# Get the parameter value
+			param = state[state_key]
+			
+			# Handle both nnx.Param and raw arrays
+			if hasattr(param, 'value'):
+				param_value = param.value
+			else:
+				param_value = param
+
+			batch_axes = tuple(sorted(either(v.batch_axes, ())))
+			assert not set(v.in_axes) - set(range(len(v.shape))), "In axes must be within shape"
+			assert not set(batch_axes) - set(range(len(v.shape))), "Batch axes must be within shape"
+			assert not set(batch_axes).intersection(v.in_axes), "Batch axes cannot be in in_axes"
+
+			# calculate number of vdims for from_optimizer=True
+			if from_optimizer:
+				v_dims = len(param_value.shape) - (2 + len(batch_axes))
+			else:
+				v_dims = len(param_value.shape) - len(v.shape)
+
+			shift = lambda x: x + v_dims
+
+			in_axes = tuple(sorted(map(shift, v.in_axes)))
+			batch_axes = tuple(range(v_dims)) + tuple(map(shift, batch_axes))
+
+			combined = set(in_axes + batch_axes)
+			out_axes = tuple(v for v in range(v_dims + len(v.shape)) if v not in combined)
+
+			transpose = batch_axes + in_axes + out_axes
+			
+			# Fix: For batch_axes, we need to handle v_dims correctly
+			def length(x):
+				if x < v_dims:
+					# This is a vmapped dimension - get its size from the param
+					return param_value.shape[x]
+				else:
+					# This is an original dimension - look it up in shape_map
+					return self.shape_map[v.shape[x-v_dims]]
+
+			batch_lens = tuple(map(length, batch_axes)) # keep
+			in_lens = tuple(map(length, in_axes)) # lookup unshifted in self state
+			out_lens = tuple(map(length, out_axes)) # lookup unshifted in self state
+
+			reshape = batch_lens + (reduce(operator.mul, in_lens, 1),) + (reduce(operator.mul, out_lens, 1),)
+
+			if not from_optimizer:
+				# Reshape to mapped shape
+				new_value = param_value.transpose(*transpose).reshape(*reshape)
+				if hasattr(param, 'replace'):
+					# Preserve the original wrapper type (VariableState, Param, etc)
+					state[state_key] = param.replace(value=new_value)
+				elif hasattr(param, 'value'):
+					# Fallback: create Param if replace not available
+					state[state_key] = nnx.Param(new_value)
+				else:
+					state[state_key] = new_value
+			else:
+				# Reshape from mapped shape back to original
+				def argsort(seq):
+					# http://stackoverflow.com/questions/3071415/efficient-method-to-calculate-the-rank-vector-of-a-list-in-python
+					return sorted(range(len(seq)), key=seq.__getitem__)
+				new_value = param_value.reshape(*batch_lens, *in_lens, *out_lens).transpose(argsort(transpose))
+				if hasattr(param, 'replace'):
+					# Preserve the original wrapper type (VariableState, Param, etc)
+					state[state_key] = param.replace(value=new_value)
+				elif hasattr(param, 'value'):
+					# Fallback: create Param if replace not available
+					state[state_key] = nnx.Param(new_value)
+				else:
+					state[state_key] = new_value
+
+		return state
+
+if __name__ == "__main__":
+	size_dict = {
+		'd': 16,
+		'k': 4,
+		'v': 4,
+		'h': 3,
+		'i': 4,
+		'f': 2
+	}
+
+	make_ueajsum = lambda c: Ueajsum(c, size_dict, rngs=nnx.Rngs(0))
+
+	# Test with explicit in_axes configuration
+	kv = make_ueajsum(
+		parser.parse("bnd,*fdhik->bnfhik").in_axes({1: (1,)}).batch_axes({1: (0,)})
+	)
+	params = nnx.state(kv, nnx.Param)
+	print("Original shapes:", jax.tree.map(lambda x: x.shape, params))
+
+	# Map to optimizer format
+	mapped = kv.map_state(params, from_optimizer=False)
+	print("Mapped shapes:", jax.tree.map(lambda x: x.shape, mapped))
+
+	# Map back from optimizer format
+	unmapped = kv.map_state(mapped, from_optimizer=True)
+	print("Unmapped shapes:", jax.tree.map(lambda x: x.shape, unmapped))
+	print("All close:", jax.tree.map(jax.numpy.allclose, params, unmapped))

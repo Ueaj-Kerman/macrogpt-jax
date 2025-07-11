@@ -6,11 +6,9 @@ from .next_token_loss import (
     chunked_softmax_cross_entropy,
 )
 
-from .optimizer_state import (
-    OptimizerManager,
-    BatchMarker,
-    BatchAccessor,
-)
+from .optimizer_config import OptimizerConfig
+from .optimizer_state import map_state
+
 
 __all__ = [
     # Loss functions
@@ -18,7 +16,6 @@ __all__ = [
     "ntp_args",
     "chunked_softmax_cross_entropy",
     # Optimizer management
-    "OptimizerManager",
-    "BatchMarker",
-    "BatchAccessor",
+    "OptimizerConfig",
+    "map_state",
 ]

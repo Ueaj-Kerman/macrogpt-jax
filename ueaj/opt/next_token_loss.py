@@ -141,7 +141,7 @@ def chunked_softmax_cross_entropy(
 		>>> from ueaj.model import LlamaModel
 		>>> model = LlamaModel.from_pretrained("meta-llama/Llama-3.2-1B")
 		>>> inputs = jnp.array([[1, 2, 3, 4, 5]])
-		>>> activations = model.get_activations(inputs)
+		>>> activations = model.learn_associative(inputs)
 		>>> loss = chunked_softmax_cross_entropy(
 		...     inputs=inputs,
 		...     activations=activations,

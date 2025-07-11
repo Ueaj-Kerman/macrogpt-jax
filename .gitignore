@@ -4,3 +4,12 @@ BACKLOG.md
 *.ipr
 *.iws
 CLAUDE.md
+hf_token.py
+ueaj/train/wandb
+__pycache__/
+*.pyc
+wandb/
+hf_token.py
+
+ueaj/opt/block
+ueaj/opt/multiscale.py

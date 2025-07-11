@@ -1,19 +1,15 @@
 import itertools
 import os
-from operator import mul
-
+import math
 os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
 
 import functools
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Callable, Dict, Literal
 
 import jax
 
 import wandb
 import uuid
-
-run_id = uuid.uuid4()
-wandb.init(project="nanogpt-euclidian", name=f"run-{run_id}")
 
 import numpy as np
 from flax import nnx
@@ -23,39 +19,27 @@ import time
 
 from ueaj import data, model
 from ueaj.opt import chunked_softmax_cross_entropy
+from ueaj.utils.stats import k_eff, tensor_stats
+from ueaj.utils.compile import compile_function
+from ueaj.utils.tensorutil import precision_aware_update
+from ueaj.opt.self_pred import learn_associative
+from ueaj.opt import OptimizerConfig
+from ueaj.opt import multiscale as ms
+from ueaj.model import configs
 import gc
 from jax import numpy as jnp
 import optax
 
-@nnx.jit
+
 def test(
-	model: model.LlamaModel,
-	inputs: jax.Array,
-	document_ids: Optional[jax.Array] = None,
-	pad_token_id: Optional[int] = None
-):
-	kwargs: dict[str, Any] = {}  # {'implementation': 'cudnn'}
-	kwargs['sequence_descriptor'] = SequenceDescriptor.from_seqlens((inputs != pad_token_id).sum(axis=1))
-	activations = model.get_activations(inputs, **kwargs)
-
-	token_loss, loss_mask = chunked_softmax_cross_entropy(
-		inputs,
-		activations,
-		model.get_logits,
-		document_ids=document_ids,
-		pad_token_id=pad_token_id,
-		return_loss_mask=True
-	)
-	mask = loss_mask.sum(dtype=jnp.float32)
-	return token_loss.sum() / mask.sum()
-
-@nnx.value_and_grad(has_aux=True)
-def grad(
-	model: model.LlamaModel,
+	g_def: nnx.GraphDef[model.LlamaModel],
+	params: nnx.State,
+	etc: nnx.State,
 	inputs: jax.Array,
 	document_ids: Optional[jax.Array] = None,
 	pad_token_id: Optional[int] = None
 ) -> Tuple[jax.Array, Any]:
+	model = nnx.merge(g_def, params, etc)
 	kwargs: dict[str, Any] = {}  # {'implementation': 'cudnn'}
 	kwargs['sequence_descriptor'] = SequenceDescriptor.from_seqlens((inputs != pad_token_id).sum(axis=1))
 	activations = model.get_activations(inputs, **kwargs)
@@ -68,78 +52,103 @@ def grad(
 		pad_token_id=pad_token_id,
 		return_loss_mask=True
 	)
-	mask = loss_mask.sum(dtype=jnp.float32)
-	return token_loss.sum() / jnp.sqrt(mask), (token_loss.mean(), token_loss.std())
+	count = loss_mask.sum(dtype=jnp.float32)
 
-main_optimizer = optax.lion(learning_rate=1e-3, b1=1, b2=.9, weight_decay=1e-2)
+	loss_val = token_loss.sum() / jnp.sqrt(count)
+	mean_loss = token_loss.sum() / count
+	std_loss = jnp.sqrt(jnp.square(token_loss - mean_loss).sum() / count)
+	return loss_val, (mean_loss, std_loss)
 
-def k_eff(W):
-	if W.ndim < 2:
-		return 1
-	n, m = W.shape
-	# careful with this one
-	# squaring number only requires slightly more exponent bits
-	W = W.astype(jnp.bfloat16)
-	# need more mantissa for accum
-	f2 = jnp.sum(jnp.square(W), dtype=jnp.float32)
-	s4 = jnp.sum(jnp.square(W @ W.T), dtype=jnp.float32)
-	return m * s4 / (f2**2)
-
-def compute_k_eff(W: jax.Array):
-	idx = W.shape.index(768)
-
-	new_shape = (W.shape[0],)
-
-	pre = functools.reduce(mul, W.shape[1:idx], 1)
-	if pre > 1:
-		new_shape += (pre,)
-
-	new_shape += (768,)
-
-	post = functools.reduce(mul, W.shape[idx+1:], 1)
-	if post > 1:
-		new_shape += (post,)
-
-	W = W.reshape(new_shape)
-	return jax.lax.scan(lambda _, x: (None, k_eff(x)), None, W)[1]
-
-@functools.partial(jax.jit, donate_argnums=(1, 2))
+@functools.partial(jax.jit, donate_argnums=(1, 4), static_argnums=(2, 7, 8, 9))
 def train_step(
 	g_def: nnx.GraphDef[model.LlamaModel],
 	state: nnx.State,
+	opt: Callable[[Dict[str, jax.Array]], optax.GradientTransformation],
+	opt_args: Dict[str, Any],
 	opt_state: optax.OptState,
 	inputs: jax.Array,
 	document_ids: Optional[jax.Array] = None,
 	pad_token_id: Optional[int] = None,
-	lr: float = 1e-4,
-	mom: float = .995
+	stats_to_collect: Tuple[str, ...] = (),  # Static arg: tuple of stat names to collect
+	technique: Literal['backprop', 'associative'] = 'backprop'
 ):
-	model_instance = nnx.merge(g_def, state)
-	(loss, (mean_loss, std_loss)), dmodel = grad(model_instance, inputs, document_ids, pad_token_id)
-	grad_norm = jax.tree.map(lambda dt: dt.std(axis=range(1, dt.ndim)), dmodel.layers)
+	params, etc = nnx.split_state(state, nnx.Param, nnx.Not(nnx.Param))
+	# Cast params if needed for computation (e.g., to bfloat16)
+	casted_params = jax.tree.map(lambda p: p.astype(jnp.bfloat16), params)
+	if technique == 'backprop':
+		dmodel, (mean_loss, std_loss) = jax.grad(test, has_aux=True, argnums=1)(
+			g_def,
+			casted_params,
+			etc,
+			inputs,
+			document_ids,
+			pad_token_id
+		)
+	elif technique == 'associative':
+		model = nnx.merge(g_def, casted_params, etc)
+		dmodel, (mean_loss, std_loss) = learn_associative(
+			model,
+			inputs,
+			document_ids,
+			pad_token_id
+		)
+	else:
+		raise ValueError(f"Unknown technique: {technique}")
 
-	params = nnx.state(model_instance, nnx.Param)
-	k_eff_par = jax.tree.map(compute_k_eff, params.layers)
+	# Update parameters
+	dmodel_updates, opt_state = opt(**opt_args).update(dmodel, opt_state, params)
+	up_params = optax.apply_updates(params, dmodel_updates)
 
-	opt = optax.lion(learning_rate=lr, b1=2*mom-1, b2=mom, weight_decay=1e-3)
-	dmodel, opt_state = opt.update(dmodel, opt_state, params)
-	params = optax.apply_updates(params, dmodel)
-	state = nnx.merge_state(nnx.state(model_instance, nnx.Not(nnx.Param)), params)
+	delta = jax.tree.map(lambda p, up: p.astype(jnp.float32) - up, params, up_params)
+	params = up_params
 
-	k_eff_mom = jax.tree.map(compute_k_eff, opt_state[0].mu.layers)
-	return state, opt_state, (mean_loss, std_loss, grad_norm, k_eff_mom, k_eff_par)
+	state = nnx.merge_state(params, etc)
+
+	# Always return a stats dict
+	stats = {}
+
+	if 'mean_loss' in stats_to_collect:
+		stats['mean_loss'] = mean_loss
+	if 'std_loss' in stats_to_collect:
+		stats['std_loss'] = std_loss
+	if 'grad_norm' in stats_to_collect:
+		stats['grad_norm'] = jax.tree.map(lambda dt: jnp.sqrt(jnp.mean(dt ** 2, dtype=jnp.float32)), dmodel)
+	if 'update_norm' in stats_to_collect:
+		stats['update_norm'] = jax.tree.map(lambda dt: jnp.sqrt(jnp.mean(dt ** 2, dtype=jnp.float32)), delta)
+
+	# Parameter statistics - compute once if any param stat is needed
+	# JAX will eliminate the computation if none are requested
+	param_stats = jax.tree.map(tensor_stats, params)
+
+	v = next(iter(nnx.to_flat_state(param_stats)))[1].value
+	for key in v.keys():
+		if f"param_{key}" in stats_to_collect:
+			stats[f'param_{key}'] = jax.tree.map(lambda s: s[key], param_stats, is_leaf=lambda x: isinstance(x, dict) and key in x)
+
+	if {'mom_l1_norm', 'mom_l2_norm', 'mom_k_eff'}.intersection(stats_to_collect):
+		mom_stats = jax.tree.map(tensor_stats, opt_state[0].mu.layers)
+
+		if 'mom_l1_norm' in stats_to_collect:
+			stats['mom_l1_norm'] = jax.tree.map(lambda s: s['l1_norm'], mom_stats, is_leaf=lambda x: isinstance(x, dict) and 'l1_norm' in x)
+		if 'mom_l2_norm' in stats_to_collect:
+			stats['mom_l2_norm'] = jax.tree.map(lambda s: s['l2_norm'], mom_stats, is_leaf=lambda x: isinstance(x, dict) and 'l2_norm' in x)
+		if 'mom_k_eff' in stats_to_collect:
+			stats['mom_k_eff'] = jax.tree.map(lambda s: s.get('k_eff', jnp.nan), mom_stats, is_leaf=lambda x: isinstance(x, dict) and 'k_eff' in x)
+
+	return state, opt_state, stats
 
 
 import datasets
 import transformers
 
-model_name = "meta-llama/Llama-3.2-1B"
+# batch_size, seq_len = 5, 4096
+batch_size, seq_len = 6, 8192
+pad_token = 50431
 
 print("Loading tokenizer...")
 tokenizer = transformers.GPT2TokenizerFast.from_pretrained("openai-community/gpt2")
-tokenizer.max_length = 1024*100
-pad_token = 65535
-
+# Set model_max_length properly - this is the attribute that actually controls the warning
+tokenizer.model_max_length = seq_len  # Set to 4096
 print("Vocab Size:", tokenizer.vocab_size)
 
 print("Loading dataset...")
@@ -152,125 +161,147 @@ dataset = datasets.load_dataset(
 
 print("Setting up train iterator...")
 
-def tokenize(examples):
-	tokenized = tokenizer(examples["text"])['input_ids']
-	return {'tokens': tokenized}
+# Use the new prepare_dataset function
+dataset, (tokens_struct, document_ids_struct) = data.prepare_dataset(
+	dataset,
+	tokenizer,
+	batch_size=batch_size,
+	seq_len=seq_len,
+	pad_token_id=pad_token,
+	buffer_size=32
+)
 
-
-def tokens(dataset):
-	for ex in dataset:
-		yield np.array(ex["tokens"], dtype=np.int32)
-
-batch_size, seq_len = 12, 4096
-
-dataset = dataset.map(tokenize, batched=True)
-dataset = dataset.select_columns("tokens")
-test_ds = itertools.cycle(dataset.take(1000))
-def chunkify(dataset):
-	dataset = tokens(dataset)
-	dataset = data.pack_documents(dataset, max_length=seq_len, min_fill_ratio=.99, pad_token_id=pad_token)
-	dataset = data.batch_iterator(dataset, batch_size=batch_size, drop_last=True, collate_fn=data.tuple_collate)
-	dataset = data.device_prefetch(dataset, buffer_size=100)
-	return dataset
-
-dataset = chunkify(dataset)
-test_data = next(chunkify(test_ds))
-del test_ds
-
-tokens = jax.ShapeDtypeStruct((batch_size, seq_len), jnp.int32)
-document_ids = jax.ShapeDtypeStruct((batch_size, seq_len), jnp.int32)
+test_tokens, test_doc_ids = next(dataset)
+dataset.send(None)
 
 print("Loading model...")
-tensor_config = model.ParamConfig("", group=nnx.Param).with_dtype(jnp.bfloat16)
-def leaky_relu_sq(x):
-	return jnp.where(x < 0, -.0625, 1) * jnp.square(x)
-
-config = model.LlamaConfig(
-	vocab_size=65536,
-	model_d=768,
-	num_layers=12,
-	tensor_config=tensor_config,
-	layer_config=model.TransformerLayerConfig(
-		model_d=768,
-		use_gated_mlp=False,
-		attention_config=model.AttentionConfig(
-			_fused=False,
-			model_d=768,
-			kq_d=64,
-			v_head_d=64,
-			kv_heads=6,
-			kv_q_ratio=2,
-			rope_theta=10_000.0,
-			param_config=tensor_config,
-			act_fn=leaky_relu_sq
-		),
-		mlp_config=model.MLPConfig(
-			model_d=768,
-			hidden_d=768*4,
-			param_config=tensor_config,
-			activation_fn=leaky_relu_sq
-		),
-		norm_config=model.RMSNormConfig(
-			model_d=768,
-			scale="centered"
-		)
-	),
-	_norm_config=model.RMSNormConfig(
-		model_d=768,
-		scale="centered"
-	)
-)
+# Use the default UEAJ configuration
+config = configs.UEAJ_150M
 model = model.LlamaModel(config, rngs=rng.Rngs(0))
 
 graph_def, state = nnx.split(model, nnx.Param)
-opt_state = main_optimizer.init(state)
+state = jax.tree.map(lambda x: x.astype(jnp.float32), state)
 
-print(config)
+import ueaj.opt.multiscale as ms
 
-print("Compiling train step...")
-print("	Tracing..")
-step = train_step.trace(
-	graph_def,
-	state,
-	opt_state,
-	tokens,
-	document_ids=document_ids,
-	pad_token_id=pad_token,
-	lr=1e-4,
-	mom=.995
+# opt_fn = lambda lr: optax.adamw(learning_rate=lr, b1=.95, b2=.999, weight_decay=1e-2, mu_dtype=jnp.float32)
+def make_optimizer(lr, cooldown_frac):
+	opt = OptimizerConfig(model)
+	c_lr = lr * (1-cooldown_frac)
+	# norm optimizer
+	lion = optax.lion(learning_rate=0.015625 * c_lr, b1=.95, b2=.95, weight_decay=1e-2)
+
+	# lm_head optimizer
+	adamw = optax.adamw(learning_rate=0.5 * c_lr, b1=.95, b2=.999, weight_decay=1e-3)
+
+	# embed optimizer (no wd)
+	adam = optax.adam(learning_rate=c_lr, b1=.95, b2=.999)
+
+	# muon = ms.muon(lr=c_lr / 8, wd=1e-3)
+	muon = ms.multiscale_muon(lr=lr / 8, wd=1e-3, cd_frac=cooldown_frac)
+
+	opt[...] = lion
+	opt['embed_tokens'] = adam
+	opt['lm_head'] = adamw
+	opt['layers', ['mlp', 'attn']] = muon
+
+	return opt.create_optimizer()
+
+opt_fn = lambda lr, cf: make_optimizer(lr=lr, cooldown_frac=cf)
+opt_arg_0 = {'lr': jnp.array(0.0625/2), 'cf': jnp.array(0.)}
+opt_state = opt_fn(**opt_arg_0).init(state)
+
+print(jax.tree.map(lambda x: (x.shape, x.dtype), opt_state))
+
+minimal_stats = ('mean_loss', 'std_loss')  # Just mean_loss and std_loss
+detailed_stats = (
+	'mean_loss', 'std_loss', 'grad_norm', 'param_l1_norm', 'update_norm'
 )
 
-print("	Lowering...")
-step = step.lower()
+# Compile two versions of train_step - minimal and detailed statistics
+print("\nCompiling train step with minimal statistics...")
+train_step_fast = compile_function(
+	train_step,
+	sample_args=(graph_def, state, opt_fn, opt_arg_0, opt_state, tokens_struct),
+	sample_kwargs={
+		'document_ids': document_ids_struct,
+		'pad_token_id': pad_token,
+		'stats_to_collect': minimal_stats,
+		'technique': 'associative'
+	},
+	name="Train Step (Fast)"
+)
 
-print("	Compiling....")
-train_step = step.compile()
+print("\nCompiling train step with detailed statistics...")
+train_step_stats = compile_function(
+	train_step,
+	sample_args=(graph_def, state, opt_fn, opt_arg_0, opt_state, tokens_struct),
+	sample_kwargs={
+		'document_ids': document_ids_struct,
+		'pad_token_id': pad_token,
+		'stats_to_collect': detailed_stats,
+		'technique': 'backprop'
+	},
+	name="Train Step (Stats)"
+)
 
-cost = train_step.cost_analysis()
-if cost and 'flops' in cost:
-	print(f"Estimated FLOPs:	{cost['flops'] * 1e-12:.2f} TFLOPs")
-	tflops = cost['flops'] * 1e-12
-else:
-	tflops = None
+print("\nCompiling test step...")
+@functools.partial(jax.jit, static_argnums=(4,))
+def run_test(graph_def, state, tokens_struct, document_ids_struct, pad_token):
+	params, etc = nnx.split_state(state, nnx.Param, nnx.Not(nnx.Param))
+	params = jax.tree.map(lambda x: x.astype(jnp.bfloat16), params)
+	return test(graph_def, params, etc, tokens_struct, document_ids_struct, pad_token)[1]
 
-# opt_state[0].mu
-cost = train_step.memory_analysis()
-if cost is not None:
-	print(f"Peak Training VRAM:	{cost.temp_size_in_bytes * 1e-9:.2f}GB")
-	print(f"Parameter VRAM:		{cost.output_size_in_bytes * 1e-9:.2f}GB")
-	print(f"Total VRAM:			{cost.temp_size_in_bytes * 1e-9 + cost.output_size_in_bytes * 1e-9:.2f}GB")
+test_compiled = compile_function(
+	run_test,
+	sample_args=(graph_def, state, tokens_struct, document_ids_struct, pad_token),
+	name="Test Step"
+)
 
-lr, n, k_eff, scale = 1e-3, 10, 0, 0
+# 315
+baseline_tokens_per_iter = 49152
+warmup_tokens = 50*baseline_tokens_per_iter # 2,457,600
+stable_tokens = warmup_tokens + 50000*baseline_tokens_per_iter # 245,760,000
+cooldown_tokens = stable_tokens + 4000*baseline_tokens_per_iter # 98,304,000
+
+print("Total tokens: ", cooldown_tokens)
+
 print("Starting training...")
+trained_tokens = 0
 for i, batch in enumerate(dataset):
+	# opt_arg = {'lr': min(i / warmup_iters, math.cos(math.pi * i / (2 * cooldown))) * opt_arg_0['lr']}
+	if trained_tokens < warmup_tokens:
+		cf = 0.
+		lr = trained_tokens / warmup_tokens
+	elif trained_tokens < stable_tokens:
+		cf = 0.
+		lr = 1.
+	elif trained_tokens < cooldown_tokens:
+		cf = (trained_tokens - stable_tokens) / (cooldown_tokens - stable_tokens)
+		lr = 1. # adjusted internally
+	else:
+		break
+
+	opt_arg = {'lr': lr * opt_arg_0['lr'], 'cf': cf}
 	tokens, doc_ids = batch
 	if i == 0:
 		gc.collect()
 
 	start_train = time.time()
-	state, opt_state, (mean_loss, std_loss, stats, k_eff_mom, k_eff_par) = train_step(
-		graph_def, state, opt_state, tokens, document_ids=doc_ids, pad_token_id=pad_token, lr=lr/n, mom=1 - 1/n
-	)
+
+	# Use statistics version every 10 iterations
+	if i % 10 == 0:
+		state, opt_state, stats = train_step_stats(
+			graph_def, state, opt_arg, opt_state, tokens, document_ids=doc_ids
+		)
+	else:
+		state, opt_state, stats = train_step_fast(
+			graph_def, state, opt_arg, opt_state, tokens, document_ids=doc_ids
+		)
+
+	# Extract loss values from stats
+	mean_loss = stats['mean_loss']
+	std_loss = stats['std_loss']
 
 	dataset.send(None)
 	gc.collect()
@@ -281,50 +312,53 @@ for i, batch in enumerate(dataset):
 
 	train_time, wait_time = end_wait - start_train, end_wait - start_wait
 
-	new_k_eff = k_eff_mom.mlp.up_proj.w_1.value.mean()
-	if jnp.isnan(new_k_eff):
-		print("[Warn] NaN detected in k_eff!")
-	elif i < 10:
-		diff = new_k_eff - k_eff
-		scale = .9 * scale + .1 * diff**2
-	else:
-		diff = new_k_eff - k_eff
-		scale = .95 * scale + .05 * diff**2
-		n = max(n + jnp.clip(diff / jnp.sqrt(max(scale, 1e-3)), -2, 2) + .01, 10.0)
-		k_eff = new_k_eff
+	# Calculate tokens per second
+	tokens_per_second = (batch_size * seq_len) / train_time
+	trained_tokens += (batch_size * seq_len)
 
 	if wait_time < .01:
 		print("[Warn] Training is outpacing data loading!")
 
 	wandb_dict = {
 		"step": i,
-		"train_loss": float(mean_loss),
-		"std_loss": float(std_loss),
+		"tokens": trained_tokens,
+		"lr": opt_arg['lr'],
 		"train_time": train_time,
 		"wait_time": wait_time,
-		"effective_batch_size": n,
-		"learning_rate": lr / n,
-		"momentum": 1 - 1/n
+		"tokens_per_second": tokens_per_second,
 	}
 
-	if i % 25 == 0:
-		model = nnx.merge(graph_def, state)
-		t_loss = test(model, test_data[0], test_data[1], pad_token)
-		wandb_dict["test_loss"] = float(t_loss)
-		print(f"Test loss: {float(t_loss):.2f}, Train time: {train_time:.2f}s, Wait time: {wait_time:.2f}s")
+	# Run test every 100 iterations
+	if i % 100 == 0:
+		test_mean, test_std = test_compiled(graph_def, state, test_tokens, test_doc_ids)
+		wandb_dict["test_loss"] = float(test_mean)
+		wandb_dict["test_loss_std"] = float(test_std)
+		print(f"Test loss: {float(test_mean):.2f}, Train time: {train_time:.2f}s, Wait time: {wait_time:.2f}s, Tokens/s: {tokens_per_second:.0f}")
 
+	# Log all statistics from the stats dict
+	for stat_name, stat_value in stats.items():
+		if isinstance(stat_value, dict) or hasattr(stat_value, 'items'):
+			for key, value in nnx.to_flat_state(stat_value):
+				if hasattr(value, 'value'):
+					value = value.value
+				wandb_dict[f"{stat_name}-" + ".".join(key)] = float(jnp.mean(value))
+		else:
+			# Handle scalar stats
+			wandb_dict[stat_name] = float(stat_value)
 
-	for key, value in nnx.to_flat_state(k_eff_mom):
-		wandb_dict["k_eff-mom-" + ".".join(key)] = value.value.mean()
-
-	for key, value in nnx.to_flat_state(k_eff_par):
-		wandb_dict["k_eff-par-" + ".".join(key)] = value.value.mean()
-
-	for key, value in nnx.to_flat_state(stats):
-		wandb_dict["gnorm-" + ".".join(key)] = value.value.mean()
-
+	if i == 0:
+		run_id = uuid.uuid4()
+		wandb.init(project="nanogpt-euclidian", name=f"run-{run_id}")
 	wandb.log(wandb_dict)
-	print(f"[{i}] Train loss: {float(mean_loss):.2f}, Std loss: {float(std_loss):.2f}, Effective batch size: {n:.1f}, Learning rate: {lr / n:.2e}, Momentum: {1 - 1/n:.2f}")
+
+	# Print basic info always, detailed stats when available
+	base_msg = f"[{i}] Train loss: {float(mean_loss):.2f}, Std loss: {float(std_loss):.2f}, Tokens/s: {tokens_per_second:.0f}, Tokens: {trained_tokens}"
+	print(base_msg)
+
 	if np.isnan(mean_loss):
 		print("Loss is NaN, stopping training...")
 		break
+
+wandb.finish()
+
+print("Done!")

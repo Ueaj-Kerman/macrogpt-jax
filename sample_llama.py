@@ -164,11 +164,6 @@ def generate(
 
 def download_model_if_needed(model_id: str, cache_dir: Optional[str] = None) -> str:
     """Download model from HuggingFace if not already cached."""
-    from huggingface_hub import HfFolder
-    
-    # Set the token if provided
-    HfFolder.save_token('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')
-    
     print(f"Downloading/loading model: {model_id}")
     
     # Download model (will use cache if already downloaded)

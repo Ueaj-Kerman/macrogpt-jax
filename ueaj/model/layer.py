@@ -1,6 +1,6 @@
 import functools
 from dataclasses import dataclass, replace
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Callable, Literal
 
 import jax
 from flax import nnx
@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from transformer_engine.jax.attention import SequenceDescriptor
 
 from ueaj.model.attention.soft_attn import SoftmaxAttention, AttentionConfig
-from ueaj.model.mlp import MLP, GMLP, MLPConfig
+from ueaj.model.mlp import MLP, GMLP, BMLP, MLPConfig
 from ueaj.model.rmsnorm import RMSNorm, RMSNormConfig
 from ueaj.model.ueajsum import ParamConfig
 from ueaj.utils.argutils import either
@@ -19,17 +19,84 @@ from ueaj.utils.argutils import either
 class TransformerLayerConfig:
 	"""Configuration for a transformer layer combining attention and MLP blocks."""
 	model_d: int
+	param_config: ParamConfig
 
-	norm_config: RMSNormConfig
-	attention_config: AttentionConfig
-	mlp_config: MLPConfig
+	# MLP type: "gated", "nongated", or "bayesian"
+	mlp_type: Literal["gated", "nongated", "bayesian"] = "gated"
 
-	# Private RMSNorm configurations
+	# Direct normalization options
+	norm_scale: str = "centered"  # "uncentered", "centered", "none"
+
+	# Direct attention configuration options
+	kq_d: int | None = None
+	v_head_d: int | None = None
+	kv_heads: int | None = None
+	kv_q_ratio: int | None = None
+	rope_theta: float | None = None
+	window_size: int | None = None
+	dropout: float = 0.
+	attn_activation_fn: Callable[[jax.Array], jax.Array] | None = None
+
+	# Direct MLP configuration options
+	hidden_d: int | None = None
+	activation_fn: Callable[[jax.Array], jax.Array] | None = None
+
+	# Private overrides
+	_norm_config: RMSNormConfig | None = None
+	_attention_config: AttentionConfig | None = None
+	_mlp_config: MLPConfig | None = None
 	_attention_norm_config: Optional[RMSNormConfig] = None
 	_mlp_norm_config: Optional[RMSNormConfig] = None
 
-	# Whether to use gated MLP
-	use_gated_mlp: bool = False
+	@property
+	def norm_config(self) -> RMSNormConfig:
+		"""Get normalization configuration."""
+		if self._norm_config is not None:
+			return self._norm_config
+		return RMSNormConfig(
+			model_d=self.model_d,
+			scale=self.norm_scale,
+			_scale_dtype=self.param_config.dtype
+		)
+
+	@property
+	def attention_config(self) -> AttentionConfig:
+		"""Get attention configuration, constructing from individual params if needed."""
+		if self._attention_config is not None:
+			# Check for redundant specifications
+			if (self.kq_d is not None or self.v_head_d is not None or self.kv_heads is not None or 
+			    self.attn_activation_fn is not None):
+				raise ValueError("Cannot specify both attention_config and individual attention parameters")
+			return self._attention_config
+		
+		return AttentionConfig(
+			model_d=self.model_d,
+			kq_d=self.kq_d or 128,
+			v_head_d=self.v_head_d or self.kq_d or 128,
+			kv_heads=self.kv_heads or (self.model_d // 128),
+			kv_q_ratio=self.kv_q_ratio or 1,
+			rope_theta=self.rope_theta,
+			window_size=self.window_size,
+			dropout=self.dropout,
+			act_fn=self.attn_activation_fn,
+			param_config=self.param_config
+		)
+
+	@property
+	def mlp_config(self) -> MLPConfig:
+		"""Get MLP configuration, constructing from individual params if needed."""
+		if self._mlp_config is not None:
+			# Check for redundant specifications
+			if self.hidden_d is not None or self.activation_fn is not None:
+				raise ValueError("Cannot specify both mlp_config and individual MLP parameters")
+			return self._mlp_config
+		
+		return MLPConfig(
+			model_d=self.model_d,
+			hidden_d=self.hidden_d or (self.model_d * 4),
+			activation_fn=self.activation_fn or nnx.swish,
+			param_config=self.param_config
+		)
 
 	@property
 	def attn_norm_config(self) -> RMSNormConfig:
@@ -49,11 +116,11 @@ class TransformerLayerConfig:
 
 	def with_attention_config(self, config: AttentionConfig):
 		"""Update attention configuration."""
-		return replace(self, attention_config=config)
+		return replace(self, _attention_config=config)
 
 	def with_mlp_config(self, config: MLPConfig):
 		"""Update MLP configuration."""
-		return replace(self, mlp_config=config)
+		return replace(self, _mlp_config=config)
 
 	def with_attention_norm(self, config: RMSNormConfig):
 		"""Update attention normalization configuration."""
@@ -63,9 +130,9 @@ class TransformerLayerConfig:
 		"""Update MLP normalization configuration."""
 		return replace(self, _mlp_norm_config=config)
 
-	def with_gated_mlp(self, use_gated: bool = True):
-		"""Enable or disable gated MLP."""
-		return replace(self, use_gated_mlp=use_gated)
+	def with_mlp_type(self, mlp_type: Literal["gated", "nongated", "bayesian"]):
+		"""Set the MLP type."""
+		return replace(self, mlp_type=mlp_type)
 
 	def validate(self):
 		"""Validate that all dimensions are consistent."""
@@ -79,6 +146,8 @@ class TransformerLayerConfig:
 		if self._mlp_norm_config:
 			assert self._mlp_norm_config.model_d == self.model_d, \
 				f"MLP norm model_d {self._mlp_norm_config.model_d} != {self.model_d}"
+		assert self.norm_config.model_d == self.model_d, \
+			f"Norm model_d {self.norm_config.model_d} != {self.model_d}"
 
 
 class TransformerLayer(nnx.Module):
@@ -95,7 +164,15 @@ class TransformerLayer(nnx.Module):
 		self.attn_norm = RMSNorm(config.attn_norm_config)
 
 		# Initialize MLP components
-		mlp_class = GMLP if config.use_gated_mlp else MLP
+		if config.mlp_type == "gated":
+			mlp_class = GMLP
+		elif config.mlp_type == "nongated":
+			mlp_class = MLP
+		elif config.mlp_type == "bayesian":
+			mlp_class = BMLP
+		else:
+			raise ValueError(f"Unknown MLP type: {config.mlp_type}")
+		
 		self.mlp = mlp_class(config.mlp_config, rngs)
 		self.mlp_norm = RMSNorm(config.mlp_norm_config)
 
@@ -117,27 +194,6 @@ class TransformerLayer(nnx.Module):
 		x += self.attn(self.attn_norm(x), **kwargs)
 		x += self.mlp(self.mlp_norm(x))
 		return x
-
-	def bwd(self, x: jax.Array, dx: jax.Array, **kwargs):
-		"""
-		Backward pass through the transformer layer.
-
-		Args:
-			x: Input tensor of shape (batch, sequence, model_d)
-			**kwargs: Additional arguments passed to attention (e.g., rope, sequence_descriptor)
-
-		Returns:
-			Output tensor of same shape as input
-		"""
-		graph_def, params, etc = nnx.split(self, nnx.Param, ...)
-
-		def g_def(params, x):
-			return nnx.merge(graph_def, params, etc)(x, **kwargs)
-
-		output, callback = jax.vjp(g_def, params, x)
-		dparams, dx = callback(dx)
-
-		return output, (dparams, dx)
 
 if __name__ == "__main__":
 	"""Test TransformerLayer.bwd."""

@@ -1,5 +1,8 @@
+import itertools
+import operator
 from dataclasses import dataclass, replace
-from typing import Tuple, Callable, Sequence, Type
+from functools import reduce
+from typing import Tuple, Callable, Sequence, Type, Mapping
 
 import jax
 from flax import nnx
@@ -17,9 +20,11 @@ class ArgumentConfig:
 	parameters, this also determines the initializer. For outputs, this sets the expected variance of the gradient.
 	:param precision: The precision with which to compute the output, or if specified for an input, the precision with
 	which to compute the gradient.
-	:param dtype: For parameters, the dtype of the parameter, for inputs it is an optional assertion.
-	:param grad_dtype: For parameters, the dtype of the gradient, though it can be applied to inputs too, but is not
+	:param _dtype: For parameters, the dtype of the parameter, for inputs it is an optional assertion.
+	:param _grad_dtype: For parameters, the dtype of the gradient, though it can be applied to inputs too, but is not
 	recommended.
+	:param in_axes: Specify the input/reducing dimensions for initialization and optimizers (like muon)
+	:param batch_axes: Specify the batch/fused dimensions that should be treated as batch dims for optimizers
 	"""
 	shape: str
 
@@ -28,6 +33,9 @@ class ArgumentConfig:
 
 	_dtype: jax.typing.DTypeLike | None = None
 	_grad_dtype: jax.typing.DTypeLike | None = None
+
+	in_axes: Tuple[int, ...] = None
+	batch_axes: Tuple[int, ...] = None
 
 	@property
 	def grad_dtype(self) -> jax.typing.DTypeLike | None:
@@ -60,6 +68,14 @@ class ArgumentConfig:
 		"""Return a config with the same attributes but a different variance."""
 		return replace(self, variance=variance)
 
+	def with_reduce_axes(self, in_axes: Tuple[int, ...]) -> "ArgumentConfig":
+		"""Return a config with the same attributes but a different reduce_dims_optimizer_heuristic."""
+		return replace(self, in_axes=in_axes)
+
+	def with_batch_axes(self, batch_axes: Tuple[int, ...]) -> "ArgumentConfig":
+		"""Return a config with the same attributes but different batch_axes."""
+		return replace(self, batch_axes=batch_axes)
+
 
 @dataclass(frozen=True)
 class ParamConfig(ArgumentConfig):
@@ -87,9 +103,12 @@ class ParamConfig(ArgumentConfig):
 		if self._initializer is None:
 			if self.variance is not None:
 				return inits.normal(stddev=jnp.sqrt(self.variance))
+			if self.in_axes is not None:
+				return inits.lecun_normal(in_axis=self.in_axes)
 			else:
 				return inits.lecun_normal(in_axis=0)
 		return self._initializer
+
 
 def group_filter(group: nnx.Variable | Sequence[nnx.Variable] | None | Callable[..., bool]):
 	if callable(group) and not issubclass(group, nnx.Variable):
@@ -107,10 +126,13 @@ def group_filter(group: nnx.Variable | Sequence[nnx.Variable] | None | Callable[
 def dtype(dtype: jax.typing.DTypeLike):
 	return lambda arg: replace(arg, _dtype=dtype)
 
+
 def grad_dtype(dtype: jax.typing.DTypeLike):
 	return lambda arg: replace(arg, _grad_dtype=dtype)
 
+
 SUMMATIONS = Tuple[Tuple[str | int, ...], ...]
+
 
 @dataclass(frozen=True)
 class UeajsumConfig:
@@ -123,7 +145,11 @@ class UeajsumConfig:
 
 	sums: SUMMATIONS
 
-	def map_arg(self, arg: str | int | Sequence[str | int], fn: Callable[[ArgumentConfig | ParamConfig], ArgumentConfig | ParamConfig]):
+	def map_arg(
+		self,
+		arg: str | int | Sequence[str | int],
+		fn: Callable[[ArgumentConfig | ParamConfig], ArgumentConfig | ParamConfig]
+	):
 		if isinstance(arg, str) and arg in self.kwarg_configs:
 			current = dict(self.kwarg_configs)
 			current[arg] = fn(current[arg])
@@ -191,3 +217,41 @@ class UeajsumConfig:
 
 	def fp32_grads(self):
 		return self.group_map(grad_dtype(jnp.float32), nnx.Param)
+
+	def in_axes(self, mapping: Mapping[str | int, Tuple[int, ...]]) -> 'UeajsumConfig':
+		config = self
+		for k, v in mapping.items():
+			config = config.map_arg(k, lambda arg: arg.with_reduce_axes(v))
+		return config
+
+	def batch_axes(self, mapping: Mapping[str | int, Tuple[int, ...]]) -> 'UeajsumConfig':
+		config = self
+		for k, v in mapping.items():
+			config = config.map_arg(k, lambda arg: arg.with_batch_axes(v))
+		return config
+
+	def in_axes_zero(self):
+		param_axes = map(
+			lambda kv: kv[0],
+			filter(
+				lambda kv: isinstance(kv[1], ParamConfig),
+				itertools.chain(enumerate(self.arg_configs), self.kwarg_configs.items())
+			)
+		)
+		return self.in_axes({k: (0,) for k in param_axes})
+
+	def get_arg(self, key: int | str):
+		if isinstance(key, int):
+			return self.arg_configs[key]
+		elif isinstance(key, str):
+			return self.kwarg_configs[key]
+		else:
+			raise ValueError(f"Unknown key {key}")
+
+
+if __name__ == "__main__":
+	a = sorted([1, 3, 1], reverse=True)
+	b = sorted([1, 3, 2], reverse=True)
+	print(a)
+	print(b)
+	print(a < b)

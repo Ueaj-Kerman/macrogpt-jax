@@ -103,3 +103,7 @@ def parse(expr, no_instantiation: bool = False, *args, **kwargs) -> UeajsumConfi
 		result_config=rhs,
 		sums=tuple(access_specs)
 	)
+
+if __name__ == "__main__":
+	config = parse("bnd,*dhik->bnhik")
+	print(config.muP_param_var({"d": 3, "h": 4, "i": 4, "k": 6}))

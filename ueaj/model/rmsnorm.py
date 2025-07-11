@@ -15,7 +15,7 @@ from ueaj.utils.gradutils import debug_dtype
 class RMSNormConfig:
 	model_d: int
 	_scale_dtype: typing.DTypeLike = None
-	scale: Literal["uncentered", "centered", "none"] = "centered"
+	scale: Literal["uncentered", "centered", "none", "single"] = "centered"
 
 	_accum_dtype: typing.DTypeLike = None
 
@@ -47,13 +47,10 @@ class RMSNorm(nnx.Module):
 	- "none": No scaling applied after normalization
 	- "uncentered": Multiply by learned weights (initialized to ones)
 	- "centered": Multiply by (1 + learned weights) where weights are initialized to zeros
-	- "expected": Llama 3 style - multiply by learned weights initialized to ones
-	              (functionally equivalent to "uncentered")
+	- "single": Multiply by a single learned scalar (initialized to one)
 	
-	The Llama 3 implementation uses what we call "expected" method:
-	- Normalizes by RMS with epsilon=1e-5 (we use 1e-6 by default)
-	- Multiplies by learnable weights initialized to ones
-	- No centering (unlike our "centered" method)
+	Note: The Llama 3 implementation uses "uncentered" scaling with epsilon=1e-5
+	(we use 1e-6 by default).
 	"""
 
 	def __init__(self, config):
@@ -62,16 +59,23 @@ class RMSNorm(nnx.Module):
 		self.accum_dtype = config.accum_dtype
 
 		initializer: nnx.Initializer | None = None
+		shape = None
+		
 		if config.scale == "uncentered":
 			initializer = nnx.initializers.ones
+			shape = (config.model_d,)
 		elif config.scale == "centered":
 			initializer = nnx.initializers.zeros
+			shape = (config.model_d,)
+		elif config.scale == "single":
+			initializer = nnx.initializers.ones
+			shape = ()  # scalar
 		elif config.scale == "none":
 			initializer = None
 
 		if initializer is not None:
 			self.scale = nnx.Param(
-				initializer(key=jax.random.PRNGKey(0), shape=(config.model_d,), dtype=config.scale_dtype)
+				initializer(key=jax.random.PRNGKey(0), shape=shape, dtype=config.scale_dtype)
 			)
 		else:
 			self.scale = None
@@ -103,6 +107,8 @@ class RMSNorm(nnx.Module):
 			return cast_fn(x * scale, input_dtype)
 		elif self.method == "centered":
 			return cast_fn(x * (1 + scale), input_dtype)
+		elif self.method == "single":
+			return cast_fn(x * scale, input_dtype)
 		else:
 			raise NotImplementedError(f"Unknown scaling method: {self.method}")
 
@@ -156,16 +162,17 @@ if __name__ == "__main__":
 	print("Std:", jnp.std(output_none))
 	print()
 
-	# Test expected (Llama 3 style) scaling
-	config_expected = RMSNormConfig(
+	# Test single scalar scaling
+	config_single = RMSNormConfig(
 		model_d=16,
 		_scale_dtype=jnp.bfloat16,
-		scale="expected"
+		scale="single"
 	)
-	rms_expected = RMSNorm(config_expected)
-	print("Expected (Llama 3 style) RMSNorm:")
-	output_expected = rms_expected(x)
-	print("Output shape:", output_expected.shape, "dtype:", output_expected.dtype)
-	print("Mean:", jnp.mean(output_expected))
-	print("Std:", jnp.std(output_expected))
-	print("\nNote: 'expected' method is equivalent to 'uncentered' but follows Llama 3 convention")
+	rms_single = RMSNorm(config_single)
+	print("Single scalar RMSNorm:")
+	output_single = rms_single(x)
+	print("Output shape:", output_single.shape, "dtype:", output_single.dtype)
+	print("Mean:", jnp.mean(output_single))
+	print("Std:", jnp.std(output_single))
+	print("Scale shape:", rms_single.scale.value.shape)
+	print("Scale value:", rms_single.scale.value)

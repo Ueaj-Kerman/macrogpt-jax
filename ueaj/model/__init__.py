@@ -10,6 +10,9 @@ from ueaj.model.attention.norm_attn import TransNormer
 # LLaMA model
 from ueaj.model.llama.llama import LlamaModel, LlamaConfig
 
+# Bayesian models
+from ueaj.model.bayes import BayesianLlamaModel
+
 # Re-export ueajsum components for convenience
 from ueaj.model.ueajsum import Ueajsum, UeajsumConfig, ParamConfig, parse
 
@@ -31,6 +34,9 @@ __all__ = [
     # LLaMA model
     "LlamaModel",
     "LlamaConfig",
+    
+    # Bayesian models
+    "BayesianLlamaModel",
     
     # Ueajsum components
     "Ueajsum",

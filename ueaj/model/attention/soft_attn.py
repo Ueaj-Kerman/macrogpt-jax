@@ -71,15 +71,27 @@ class AttentionConfig:
 		return self.kq_d == self.v_head_d
 
 	def with_down(self, config: us.ParamConfig):
+		# Check for redundancy - if config is same as param_config, raise error
+		if config == self.param_config:
+			raise ValueError("Redundant specification: k_config is same as param_config")
 		return replace(self, _k_config=config)
 
 	def with_up(self, config: us.ParamConfig):
+		# Check for redundancy - if config is same as param_config, raise error
+		if config == self.param_config:
+			raise ValueError("Redundant specification: v_config is same as param_config")
 		return replace(self, _v_config=config)
 
 	def with_q(self, config: us.ParamConfig):
+		# Check for redundancy - if config is same as param_config, raise error
+		if config == self.param_config:
+			raise ValueError("Redundant specification: q_config is same as param_config")
 		return replace(self, _q_config=config)
 
 	def with_o(self, config: us.ParamConfig):
+		# Check for redundancy - if config is same as param_config with zeros init, raise error
+		if config == self.param_config.with_initializer(nnx.initializers.zeros):
+			raise ValueError("Redundant specification: o_config is same as param_config with zeros initializer")
 		return replace(self, _o_config=config)
 
 	def with_fused(self, fused: bool = True):
@@ -108,19 +120,21 @@ class SoftmaxAttention(nnx.Module, ABC):
 		if config.fused:
 			assert config.kq_d == config.v_head_d, "Fused kv must have same kq_d and v_head_d"
 			self.kv = make_ueajsum(
-				us.parse("bnd,*fdhk->bnfhk").param(config.k_config).group_map(
-					lambda x: x.with_initializer(nnx.initializers.lecun_normal(in_axis=0)),
-					nnx.Param
-				)
+				us.parse("bnd,*fdhk->bnfhk").param(config.k_config).in_axes({1: (1,)}).batch_axes({1: (0,)}),
 			)
 			self.fused_kv = True
 		else:
-			self.k = make_ueajsum(us.parse("bnd,*dhk->bnhk").param(config.k_config))
-			self.v = make_ueajsum(us.parse("bnd,*dhv->bnhv").param(config.v_config))
+			self.k = make_ueajsum(us.parse("bnd,*dhk->bnhk").param(config.k_config).in_axes_zero())
+			self.v = make_ueajsum(us.parse("bnd,*dhv->bnhv").param(config.v_config).in_axes_zero())
 			self.fused_kv = False
 
-		self.q = make_ueajsum(us.parse("bnd,*dhik->bnhik").param(config.q_config))
-		self.o = make_ueajsum(us.parse("bnhiv,*hivd->bnd").param(config.o_config))
+		self.q = make_ueajsum(us.parse("bnd,*dhik->bnhik").param(config.q_config).in_axes_zero())
+		self.o = make_ueajsum(
+			us.parse("bnhiv,*hivd->bnd").param(config.o_config).in_axes({1: (0, 1, 2)}).group_map(
+				lambda x: x.with_initializer(nnx.initializers.zeros),
+				nnx.Param
+			)
+		)
 
 		if config.rope_theta is not None:
 			# Use the same dtype as the attention mechanism
@@ -136,7 +150,6 @@ class SoftmaxAttention(nnx.Module, ABC):
 
 		if self.fused_kv:
 			kv = self.kv(x)
-			# kv = debug_grad_flow(kv, "kv")
 			k = kv[:, :, 0, :, :]
 		else:
 			k = self.k(x)
@@ -184,7 +197,7 @@ class SoftmaxAttention(nnx.Module, ABC):
 				window_size=self.config.window_tuple(),
 				max_segments_per_seq=ceil(n / 1024),
 			)
-		else: # TODO TPU attention, maybe just ring attn repo?
+		else:  # TODO TPU attention, maybe just ring attn repo?
 			if fused:
 				k, v = kv[:, :, 0, :, :], kv[:, :, 1, :, :]
 				fused = False
@@ -196,21 +209,11 @@ class SoftmaxAttention(nnx.Module, ABC):
 				window_size=self.config.window_tuple(),
 			)
 		if fused:
-			# q_reshaped = debug_grad_flow(q_reshaped, "q_reshaped")
-			# kv = debug_grad_flow(kv, "kv")
 			out = model.apply({}, query=q_reshaped, key=kv, value=None, **attn_kwargs)
 		else:
-			# q_reshaped = debug_grad_flow(q_reshaped, "q_reshaped")
-			# k = debug_grad_flow(k, "k")
-			# v = debug_grad_flow(v, "v")
 			out = model.apply({}, query=q_reshaped, key=k, value=v, **attn_kwargs)
 
-		# if self.fused_kv:
-		# 	k, v = kv[:, :, 0, :, :], kv[:, :, 1, :, :]
-		# out = jax.nn.dot_product_attention(
-		# 	query=q_reshaped, key=k, value=v, is_causal=True, **attn_kwargs
-		# )
-		out = out.reshape(b, n, h, i, self.config.v_head_d)
+		out = out.reshape(b, n, h, i, self.config.v_head_d).astype(jnp.bfloat16)
 		if self.config.act_fn is not None:
 			out = self.config.act_fn(out)
 		y = self.o(out)
