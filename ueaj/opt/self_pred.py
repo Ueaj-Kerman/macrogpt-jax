@@ -17,7 +17,7 @@ def learn_local(prev_vjp, prev_act, curr_act, forward_model, **kwargs):
 	act_grad = (next_act - curr_act) # ask prev layer to learn from current layer
 	if prev_act is not None:
 		act_grad += .75*(prev_act - curr_act) # ask prev layer to unlearn what it already learnt
-	act_grad = act_grad / jnp.sqrt(jnp.mean(jnp.square(act_grad))+1e-3)
+	act_grad = act_grad / jnp.maximum(jnp.sqrt(jnp.mean(jnp.square(act_grad))+1e-3), 1.)
 	(dprev, ) = prev_vjp(-act_grad) # negative gradient
 	dprev = jax.tree.map(lambda x: x / (act_grad.shape[0] * act_grad.shape[1]), dprev)
 	return dprev, next_act, next_vjp

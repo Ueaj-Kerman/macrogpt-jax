@@ -189,26 +189,27 @@ def make_optimizer(lr, cooldown_frac):
 	opt = OptimizerConfig(model)
 	c_lr = lr * (1-cooldown_frac)
 	# norm optimizer
-	lion = optax.lion(learning_rate=0.015625 * c_lr, b1=.95, b2=.95, weight_decay=1e-2)
+	norm = optax.lion(learning_rate=0.015625 * c_lr, b1=.95, b2=.95, weight_decay=1e-2)
 
 	# lm_head optimizer
-	adamw = optax.adamw(learning_rate=0.5 * c_lr, b1=.95, b2=.999, weight_decay=1e-3)
+	lm_head = optax.adamw(learning_rate=0.5 * c_lr, b1=.95, b2=.999, weight_decay=1e-3)
 
 	# embed optimizer (no wd)
-	adam = optax.adam(learning_rate=c_lr, b1=.95, b2=.999)
+	embed = optax.adam(learning_rate=c_lr, b1=.95, b2=.999)
 
-	# muon = ms.muon(lr=c_lr / 8, wd=1e-3)
-	muon = ms.multiscale_muon(lr=lr / 8, wd=1e-3, cd_frac=cooldown_frac)
+	# tensor = ms.muon(lr=c_lr / 8, wd=1e-3)
+	tensor = ms.multiscale_muon(lr=lr / 8, wd=1e-3, cd_frac=cooldown_frac)
+	# tensor = optax.adamw(learning_rate=0.5 * c_lr, b1=0., b2=0., weight_decay=1e-3)
 
-	opt[...] = lion
-	opt['embed_tokens'] = adam
-	opt['lm_head'] = adamw
-	opt['layers', ['mlp', 'attn']] = muon
+	opt[...] = norm
+	opt['embed_tokens'] = embed
+	opt['lm_head'] = lm_head
+	opt['layers', ['mlp', 'attn']] = tensor
 
 	return opt.create_optimizer()
 
 opt_fn = lambda lr, cf: make_optimizer(lr=lr, cooldown_frac=cf)
-opt_arg_0 = {'lr': jnp.array(0.0625/2), 'cf': jnp.array(0.)}
+opt_arg_0 = {'lr': jnp.array(0.0625), 'cf': jnp.array(0.)}
 opt_state = opt_fn(**opt_arg_0).init(state)
 
 print(jax.tree.map(lambda x: (x.shape, x.dtype), opt_state))
@@ -232,6 +233,11 @@ train_step_fast = compile_function(
 	name="Train Step (Fast)"
 )
 
+# TODO: no momentum
+# TODO: reguarlize embeds
+# TODO: lower lr?
+# TODO: remove cooldown
+
 print("\nCompiling train step with detailed statistics...")
 train_step_stats = compile_function(
 	train_step,
@@ -240,7 +246,7 @@ train_step_stats = compile_function(
 		'document_ids': document_ids_struct,
 		'pad_token_id': pad_token,
 		'stats_to_collect': detailed_stats,
-		'technique': 'backprop'
+		'technique': 'associative'
 	},
 	name="Train Step (Stats)"
 )
@@ -260,7 +266,7 @@ test_compiled = compile_function(
 
 # 315
 baseline_tokens_per_iter = 49152
-warmup_tokens = 50*baseline_tokens_per_iter # 2,457,600
+warmup_tokens = 500*baseline_tokens_per_iter # 2,457,600
 stable_tokens = warmup_tokens + 50000*baseline_tokens_per_iter # 245,760,000
 cooldown_tokens = stable_tokens + 4000*baseline_tokens_per_iter # 98,304,000
 
@@ -309,6 +315,8 @@ for i, batch in enumerate(dataset):
 	start_wait = time.time()
 	mean_loss.block_until_ready()
 	end_wait = time.time()
+
+	state.embed_tokens.embedding.value = nnx.RMSNorm(config.model_d, use_scale=False, rngs=nnx.Rngs(0))(state.embed_tokens.embedding.value)
 
 	train_time, wait_time = end_wait - start_train, end_wait - start_wait
 
