@@ -16,7 +16,7 @@ Main implementation of the optimizer configuration system. Provides:
 Contains helper classes and functions:
 - `TensorRegion`: Represents a region of a tensor with an optimizer
 - `TensorSplitter`: Manages non-overlapping regions for tensors
-- `map_state`: Transforms state to/from optimizer format for Ueajsum modules
+- `map_state`: Identity transformation (no special state mapping needed with simplified Einsum)
 
 ### 3. `index_set.py`
 Efficient index set representation for tensor slicing:

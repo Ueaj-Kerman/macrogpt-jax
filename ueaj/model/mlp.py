@@ -1,177 +1,123 @@
-from dataclasses import dataclass, replace
-from typing import Callable
+from typing import *
 
 import jax
 from jax import numpy as jnp
 from flax import nnx
 from flax.nnx import rnglib as rng
-from ueaj.model import ueajsum as us
-from ueaj.utils.argutils import either
-from ueaj.utils.collections import LOW_PRECISION
-from ueaj.utils.gradutils import debug_dtype, custom_grad_vectors
-from jax.ad_checkpoint import checkpoint_name
-
-@dataclass
-class MLPConfig:
-	model_d: int
-	hidden_d: int
-
-	activation_fn: Callable[[jax.Array], jax.Array] = nnx.swish
-
-	param_config: us.ParamConfig = us.ParamConfig("", group=nnx.Param)
-
-	_gate_config: us.ParamConfig | None = None
-	_up_config: us.ParamConfig | None = None
-	_down_config: us.ParamConfig | None = None
-
-	@property
-	def up_config(self):
-		return either(self._up_config, self.param_config)
-
-	@property
-	def down_config(self):
-		return either(self._down_config, self.param_config.with_initializer(nnx.initializers.zeros))
-
-	@property
-	def gate_config(self):
-		return either(self._gate_config, self.param_config)
-
-	def with_gate(self, config: us.ParamConfig):
-		# Check for redundancy - if config is same as param_config, raise error
-		if config == self.param_config:
-			raise ValueError("Redundant specification: gate_config is same as param_config")
-		return replace(self, _gate_config=config)
-
-	def with_up(self, config: us.ParamConfig):
-		# Check for redundancy - if config is same as param_config, raise error
-		if config == self.param_config:
-			raise ValueError("Redundant specification: up_config is same as param_config")
-		return replace(self, _up_config=config)
-
-	def with_down(self, config: us.ParamConfig):
-		# Check for redundancy - if config is same as param_config with zeros init, raise error
-		if config == self.param_config.with_initializer(nnx.initializers.zeros):
-			raise ValueError("Redundant specification: down_config is same as param_config with zeros initializer")
-		return replace(self, _down_config=config)
-
-	def with_param(self, config: us.ParamConfig):
-		return replace(self, param_config=config)
+from ueaj.model.einsum import *
+from ueaj.utils import *
+from ueaj.utils.configurator import *
 
 
+@config
 class MLP(nnx.Module):
-	def __init__(self, config: MLPConfig, rngs: rng.Rngs):
-		super().__init__()
-		size_dict = {'d': config.model_d, 'h': config.hidden_d}
+    def __init__(self, 
+        model_d: int,
+        rngs: rng.Rngs,
+        hidden_d: int | None = None,  # Defaults to 4 * model_d
+        act_fn: Callable[[jax.Array], jax.Array] = nnx.swish,
+        param_dtype: jnp.dtype = jnp.bfloat16
+    ):
+        super().__init__()
+        if hidden_d is None:
+            hidden_d = 4 * model_d
+        size_dict = {'d': model_d, 'h': hidden_d}
+        
+        # Create projections with LeCun initialization
+        self.up_proj = Einsum(
+            "bnd,dh->bnh",
+            nnx.initializers.lecun_normal(),
+            size_dict,
+            rngs=rngs,
+            dtype=param_dtype
+        )
+        self.down_proj = Einsum(
+            "bnh,hd->bnd",
+            nnx.initializers.zeros_init(),
+            size_dict,
+            rngs=rngs,
+            dtype=param_dtype
+        )
+        self.activation_fn = act_fn
 
-		make_ueajsum = lambda c: us.Ueajsum(c, size_dict, rngs=rngs)
-		self.up_proj = make_ueajsum(
-			us.parse("bnd,*dh->bnh").param(config.up_config).in_axes_zero()
-		)
-		self.down_proj = make_ueajsum(
-			us.parse("bnh,*hd->bnd").param(config.down_config).in_axes_zero()
-		)
-
-		self.activation_fn = config.activation_fn
-
-	@nnx.jit
-	def __call__(self, x):
-		x = self.up_proj(x)
-		x = self.activation_fn(x)
-		x = self.down_proj(x)
-		return x
-
-	def invoke_fp32_backprop(self, x):
-		x = self.up_proj.invoke(self.up_proj.config.map_arg(0, lambda x: x.with_grad_dtype(jnp.float32)), False, x)
-		x = self.activation_fn(x)
-		x = self.down_proj.invoke(self.down_proj.config.map_arg(0, lambda x: x.with_grad_dtype(jnp.float32)), False, x)
-		return x
+    def __call__(self, x):
+        x = self.up_proj(x)
+        x = self.activation_fn(x)
+        x = self.down_proj(x)
+        return x
 
 
+@config
 class GMLP(nnx.Module):
-	def __init__(self, config: MLPConfig, rngs: rng.Rngs):
-		super().__init__()
-		size_dict = {'d': config.model_d, 'h': config.hidden_d, 'i': 2}
+    def __init__(self, 
+        model_d: int,
+        rngs: rng.Rngs,
+        hidden_d: int | None = None,  # Defaults to 4 * model_d
+        activation_fn: Callable[[jax.Array], jax.Array] = nnx.swish,
+        param_dtype: jnp.dtype = jnp.bfloat16
+    ):
+        super().__init__()
+        if hidden_d is None:
+            hidden_d = 4 * model_d
+        
+        # Create fused gate/up projection with LeCun initialization
+        size_dict_fused = {'d': model_d, 'h': hidden_d, 'i': 2}
+        self.fused_proj = Einsum(
+            "bnd,idh->ibnh",
+            nnx.initializers.lecun_normal(),
+            size_dict_fused,
+            batch_dims="i",
+            rngs=rngs,
+            dtype=param_dtype
+        )
+        
+        size_dict = {'d': model_d, 'h': hidden_d}
+        self.down_proj = Einsum(
+            "bnh,hd->bnd",
+            nnx.initializers.zeros_init(),
+            size_dict,
+            rngs=rngs,
+            dtype=param_dtype
+        )
+        self.activation_fn = activation_fn
 
-		make_ueajsum = lambda c: us.Ueajsum(c, size_dict, rngs=rngs)
-		self.fused_proj = make_ueajsum(
-			us.parse("bnd,*idh->ibnh").param(config.up_config).in_axes({1: (1,)}).batch_axes({1: (0,)})
-		)
+    def __call__(self, x):
+        up, gate = self.fused_proj(x)
 
-		self.down_proj = make_ueajsum(
-			us.parse("bnh,bnh,*hd->bnd").param(config.down_config).in_axes_zero()
-		)
-		self.activation_fn = config.activation_fn
+        gate = self.activation_fn(gate)
 
-	def __call__(self, x):
-		up, gate = self.fused_proj(x)
+        # Apply gating
+        if x.dtype not in LOW_PRECISION:
+            x = up * gate
+        else:
+            s = jnp.max(jnp.abs(up), axis=(0, 1), keepdims=True) + 1
+            x = (s * up) * gate
+            x = x / s
+        
+        # Apply down projection
+        x = self.down_proj(x)
 
-		gate = self.activation_fn(gate)
-
-		if x.dtype not in LOW_PRECISION:
-			x = self.down_proj(up, gate)
-		else:
-			s = jnp.max(jnp.abs(up), axis=(0, 1), keepdims=True) + 1
-			x = (s * up) * gate
-			x = x / s
-			x = self.down_proj.parse_and_call("bnh,[1]->bnd", x)
-
-		return x
-
-
-class BMLP(nnx.Module):
-	"""Bayesian MLP with mean and variance projections"""
-	def __init__(self, config: MLPConfig, rngs: rng.Rngs):
-		super().__init__()
-		size_dict = {'d': config.model_d, 'h': config.hidden_d}
-		
-		make_ueajsum = lambda c: us.Ueajsum(c, size_dict, rngs=rngs)
-		
-		# Up projection for mean
-		self.up_proj = make_ueajsum(
-			us.parse("bnd,*dh->bnh").param(config.up_config).in_axes_zero()
-		)
-		
-		# Variance projection - uses gate_config for custom learning rate
-		self.var_proj = make_ueajsum(
-			us.parse("bnd,*dh->bnh").param(config.gate_config).in_axes_zero()
-		)
-		
-		# Down projection
-		self.down_proj = make_ueajsum(
-			us.parse("bnh,*hd->bnd").param(config.down_config).in_axes_zero()
-		)
-		
-		self.activation_fn = config.activation_fn
-		self.var_lr = .1  # Learning rate multiplier for variance
-	
-	def __call__(self, x):
-		# Project to get mean and variance
-		mean = self.up_proj(x)
-
-		var = self.var_proj(x)
-		var = nnx.softplus(var)
-		
-		h = custom_grad_vectors(mean, var, self.var_lr)
-		
-		h = self.activation_fn(h)
-		
-		x = self.down_proj(h)
-		return x
+        return x
 
 
 if __name__ == "__main__":
-	config = MLPConfig(
-		model_d=16,
-		hidden_d=32,
-		activation_fn=nnx.relu,
-	)
-	x = jnp.ones((1, 1, 16))
-	m = MLP(config.with_down(config.param_config.with_initializer(nnx.initializers.lecun_normal())), rngs=rng.Rngs(0))
-	gm = GMLP(config.with_down(config.param_config.with_initializer(nnx.initializers.lecun_normal())),
-		rngs=rng.Rngs(0))
-	bm = BMLP(config.with_down(config.param_config.with_initializer(nnx.initializers.lecun_normal())),
-		rngs=rng.Rngs(0))
-
-	print(m(x))
-	print(gm(x))
-	print(bm(x))
+    rngs = rng.Rngs(0)
+    x = jnp.ones((1, 1, 16))
+    
+    # Direct instantiation with defaults
+    m = MLP(
+        model_d=16,
+        hidden_d=32,
+        rngs=rngs,
+        act_fn=nnx.relu
+    )
+    
+    # Using override to create custom GMLP
+    GMLPCustom = GMLP.override(
+        activation_fn=nnx.relu,
+        param_dtype=jnp.float32
+    )
+    gm = GMLPCustom(model_d=16, hidden_d=32, rngs=rngs)
+    
+    print(m(x))
+    print(gm(x))

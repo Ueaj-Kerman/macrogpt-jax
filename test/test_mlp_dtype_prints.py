@@ -18,10 +18,9 @@ import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import rnglib as rng
 
-from ueaj.utils import astype_fwd_noop_bwd
+from ueaj.utils import astype_fwd_noop_bwd, LOW_PRECISION
 from ueaj.model.mlp import MLP, GMLP, MLPConfig
 from ueaj.model.ueajsum import ParamConfig
-from ueaj.utils.collections import LOW_PRECISION
 
 
 def test_mlp_configurations():

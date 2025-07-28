@@ -11,9 +11,9 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from transformers import AutoTokenizer
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, HfFolder
 
-from ueaj.model.llama import LlamaModel, LlamaConfig
+from ueaj.model.llama import LlamaModel
 
 
 def sample_from_logits(
@@ -282,7 +282,7 @@ def main():
     model = LlamaModel.from_pretrained(
         model_path,
         dtype=dtype,
-        abstract=True,
+        abstract=False,
     )
     
     print(f"Model loaded successfully!")

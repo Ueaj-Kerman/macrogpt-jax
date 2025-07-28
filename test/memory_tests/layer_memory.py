@@ -1,4 +1,4 @@
-from transformer_engine.jax.attention import SequenceDescriptor
+# from transformer_engine.jax.attention import SequenceDescriptor
 
 from test_memory import memory_report
 from ueaj.model.layer import TransformerLayer
@@ -31,7 +31,8 @@ def compile_layer_bwd():
 	segment_ids = jax.ShapeDtypeStruct(shape=(16, 4096), dtype=jnp.int32)
 
 	def layer_diff(graph_def, params, etc, x, segment_ids):
-		return nnx.merge(graph_def, params, etc)(x, sequence_descriptor=SequenceDescriptor.from_segment_ids_and_pos(segment_ids))
+		# Use segment IDs directly instead of SequenceDescriptor
+		return nnx.merge(graph_def, params, etc)(x, query_segment_ids=segment_ids, kv_segment_ids=segment_ids)
 
 	# return jnp.square(x-y).sum(dtype=jnp.bfloat16)
 

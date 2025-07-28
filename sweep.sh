@@ -1,0 +1,2 @@
+OPTIMIZER=multiscale RUN_NAME=multiscale MODEL_PATH=mmuon.safetensors ./run_python.sh -m ueaj.train.train.py
+OPTIMIZER=muon RUN_NAME=muon MODEL_PATH=muon.safetensors ./run_python.sh -m ueaj.train.train.py

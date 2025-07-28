@@ -2,8 +2,16 @@ import os
 import typing
 
 import jax
-from jax import config
+from jax import config, numpy as jnp
 from jax import numpy as jnp
+
+LOW_PRECISION = set(map(jax.dtypes.canonicalize_dtype, (
+	jnp.float8_e4m3fn,
+	jnp.float8_e5m2,
+	jnp.float8_e4m3fnuz,
+	jnp.float8_e5m2fnuz,
+	jnp.float8_e4m3b11fnuz,
+)))
 
 T = typing.TypeVar('T')
 
@@ -38,3 +46,4 @@ DEFAULT_ACCUM_TYPE = make_config(
 	jax.dtypes.canonicalize_dtype(os.environ.get('DEFAULT_ACCUM_TYPE', jnp.bfloat16 if backend == 'tpu' else jnp.float32)),
 	help='Set the default accumulation type for rmsnorm among other things.'
 )
+

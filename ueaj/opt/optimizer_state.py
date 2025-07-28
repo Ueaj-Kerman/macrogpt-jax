@@ -3,7 +3,6 @@
 import optax
 from flax import nnx
 from optax import GradientTransformation
-from ueaj.model import ueajsum
 from typing import Dict, Tuple, Any, List, Optional
 from collections import defaultdict
 import jax
@@ -13,41 +12,13 @@ from .index_set import IndexSet
 
 
 def map_state(model: nnx.Module, from_: bool = False) -> GradientTransformation:
-	"""Transform state to/from optimizer format for Ueajsum modules.
+	"""Identity transformation - no special state mapping needed.
 	
-	This creates an optax transformation that calls map_state on each Ueajsum
-	module in the model to transform parameters between normal and optimizer formats.
+	With the simplified Einsum implementation, we no longer need special 
+	parameter transformations for optimizer state.
 	"""
-	def map_state_fn(state: nnx.State):
-		# Create a deep copy of the state to avoid modifying the original
-		import copy
-		result = copy.deepcopy(state)
-		
-		# Each Ueajsum module knows how to transform its own parameters
-		for path, module in model.iter_modules():
-			if isinstance(module, ueajsum.Ueajsum):
-				# Extract the substate for this module
-				current = result
-				for key in path[:-1]:
-					if key in current:
-						current = current[key]
-					else:
-						break
-				else:
-					# We found the parent, now get the module's state
-					module_key = path[-1] if path else None
-					if module_key and module_key in current:
-						module_state = current[module_key]
-						
-						# Transform the module's parameters
-						transformed = module.map_state(module_state, from_optimizer=from_)
-						
-						# Update in place
-						current[module_key] = transformed
-		
-		return result
-
-	return optax.stateless(lambda updates, _: map_state_fn(updates))
+	# Simply return an identity transformation
+	return optax.identity()
 
 
 @dataclass

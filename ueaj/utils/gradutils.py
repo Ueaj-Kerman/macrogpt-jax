@@ -128,10 +128,13 @@ def debug_grad_flow(x: jax.Array, name: str = "tensor") -> jax.Array:
 
 	def _fwd(x):
 		# Forward: convert to target dtype
+		print(f"[FWD] {name}: dtype = {x.dtype}")
+		jax.debug.print("[FWD] {}: {}", name, jnp.sqrt(jnp.square(x).mean()))
 		return x, None
 
 	def _bwd(_, g):
 		# Backward: return gradient as-is and print debug info
+		print(f"[BWD] {name}: dtype = {g.dtype}")
 		jax.debug.print("[BWD] {}: {}", name, jnp.sqrt(jnp.square(g).mean()))
 		return (g,)
 

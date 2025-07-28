@@ -1,11 +1,10 @@
 jax[cuda12]~=0.6.2
 flax~=0.10.6
 datasets~=3.6.0
-transformer_engine[jax]
+kvax~=0.1.0
 huggingface_hub~=0.33.0
 transformers~=4.52.4
 wandb
-transformer_engine~=2.4.0
 numpy~=2.3.1
 optax~=0.2.5
 safetensors~=0.5.3
