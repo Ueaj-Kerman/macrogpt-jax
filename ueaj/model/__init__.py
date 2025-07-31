@@ -13,3 +13,5 @@ from ueaj.model.model import *
 # Re-export einsum components for convenience
 from ueaj.model.einsum import *
 
+# Configuration
+from ueaj.model.configs import *

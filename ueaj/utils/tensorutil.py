@@ -3,12 +3,10 @@ from typing import Any, Callable, Union, Tuple, TypeVar, List
 
 import jax
 import jax.lax
-import jax.numpy as jnp
 from flax import nnx
 from jax import numpy as jnp
 
-from ueaj.utils import config
-
+from ueaj.utils import LOW_PRECISION
 
 def chunked_scan(
 	f: Callable,
@@ -96,7 +94,7 @@ def slice(module: T) -> SliceModule[T]:
 def promote_fp8(*args) -> List[jax.Array]:
 	has_fp8, gcd_type = False, None
 	for arg in args:
-		if arg.dtype in config.LOW_PRECISION:
+		if arg.dtype in LOW_PRECISION:
 			has_fp8 = True
 		elif gcd_type is None:
 			gcd_type = arg.dtype
@@ -107,7 +105,7 @@ def promote_fp8(*args) -> List[jax.Array]:
 		return [
 			(
 				jax.lax.convert_element_type(a, jnp.dtype(gcd_type))
-				if a.dtype in config.LOW_PRECISION
+				if a.dtype in LOW_PRECISION
 				else a
 			) for a in args
 		]

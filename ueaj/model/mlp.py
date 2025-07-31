@@ -98,26 +98,3 @@ class GMLP(nnx.Module):
         x = self.down_proj(x)
 
         return x
-
-
-if __name__ == "__main__":
-    rngs = rng.Rngs(0)
-    x = jnp.ones((1, 1, 16))
-    
-    # Direct instantiation with defaults
-    m = MLP(
-        model_d=16,
-        hidden_d=32,
-        rngs=rngs,
-        act_fn=nnx.relu
-    )
-    
-    # Using override to create custom GMLP
-    GMLPCustom = GMLP.override(
-        activation_fn=nnx.relu,
-        param_dtype=jnp.float32
-    )
-    gm = GMLPCustom(model_d=16, hidden_d=32, rngs=rngs)
-    
-    print(m(x))
-    print(gm(x))

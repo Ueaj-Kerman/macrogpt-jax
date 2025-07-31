@@ -91,74 +91,6 @@ class LlamaModel(nnx.Module):
 		"""For backwards compatibility."""
 		return self
 
-	def default_kwargs(self, batch_size: int, seq_len: int, **kwargs) -> Dict[str, Any]:
-		# Get or create segment IDs
-		if 'query_segment_ids' not in kwargs:
-			# Default: all tokens in same segment
-			kwargs['query_segment_ids'] = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
-		if 'kv_segment_ids' not in kwargs:
-			kwargs['kv_segment_ids'] = kwargs['query_segment_ids']
-
-		if 'rope' not in kwargs:
-			# Check if first layer has rope (layers is vmapped)
-			first_layer = jax.tree.leaves(self.layers)[0]
-			if hasattr(first_layer, 'attn') and hasattr(first_layer.attn, 'rope') and first_layer.attn.rope is not None:
-				# Create rope if not provided
-				rope = first_layer.attn.rope
-				# Cast position IDs to float to ensure correct dtype propagation
-				pos_ids = jnp.arange(seq_len, dtype=jnp.float32)
-				kwargs['rope'] = rope.compute_freqs(pos_ids)
-		
-		# Create attention mask and position IDs for all layers
-		if 'position_ids' not in kwargs:
-			# Default to sequential positions
-			kwargs['position_ids'] = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
-			kwargs['position_ids'] = jnp.broadcast_to(kwargs['position_ids'], (batch_size, seq_len))
-		
-		query_positions = kwargs.get('query_positions', kwargs['position_ids'])
-		kv_positions = kwargs.get('kv_positions', kwargs['position_ids'])
-		
-		# Import kvax components
-		from kvax.ops import create_attention_mask
-		from kvax.utils.common import FlashAttentionParamsConfig
-		from ueaj.utils.kvax_context import get_kvax_context
-		
-		# Get kvax context
-		kvax_ctx = get_kvax_context()
-		
-		# Create attention mask once for all layers
-		with kvax_ctx():
-			# Create flash attention params
-			fwd_params = FlashAttentionParamsConfig(
-				query_block_size=64,
-				kv_block_size=64,
-				num_warps=4,
-				num_stages=3
-			)
-			bwd_params = FlashAttentionParamsConfig(
-				query_block_size=64,
-				kv_block_size=64,
-				num_warps=4,
-				num_stages=3
-			)
-			
-			# Create attention mask
-			attention_mask = create_attention_mask(
-				query_positions=query_positions,
-				query_segment_ids=kwargs['query_segment_ids'],
-				kv_positions=kv_positions,
-				kv_segment_ids=kwargs['kv_segment_ids'],
-				calc_bwd_mask=True,  # Required for gradient computation
-				fwd_params=fwd_params,
-				bwd_params=bwd_params,
-			)
-		
-		kwargs['attention_mask'] = attention_mask
-		kwargs['query_positions'] = query_positions
-		kwargs['kv_positions'] = kv_positions
-
-		return kwargs
-
 	def get_activations(self, input_ids: jax.Array, **kwargs) -> jax.Array:
 		"""
 		Get hidden states without final norm and lm_head projection.
@@ -233,24 +165,71 @@ class LlamaModel(nnx.Module):
 		hidden_states = self.get_activations(input_ids, **kwargs)
 		return self.get_logits(hidden_states)
 
-	@classmethod
-	def from_pretrained(
-		cls,
-		model_path: str,
-		rngs: Optional[rng.Rngs] = None,
-		dtype: Optional[jax.typing.DTypeLike] = None,
-		abstract: bool = False,
-	) -> "LlamaModel":
-		"""
-		Load a pretrained Llama model from safetensors files.
+	def default_kwargs(self, batch_size: int, seq_len: int, **kwargs) -> Dict[str, Any]:
+		# Get or create segment IDs
+		if 'query_segment_ids' not in kwargs:
+			# Default: all tokens in same segment
+			kwargs['query_segment_ids'] = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
+		if 'kv_segment_ids' not in kwargs:
+			kwargs['kv_segment_ids'] = kwargs['query_segment_ids']
 
-		Args:
-			model_path: Path to directory containing safetensors files
-			rngs: Random number generators
-			dtype: Data type for model parameters
-			abstract: If True, create abstract model without allocating weights
+		if 'rope' not in kwargs:
+			# Check if first layer has rope (layers is vmapped)
+			first_layer = jax.tree.leaves(self.layers)[0]
+			if hasattr(first_layer, 'attn') and hasattr(first_layer.attn, 'rope') and first_layer.attn.rope is not None:
+				# Create rope if not provided
+				rope = first_layer.attn.rope
+				# Cast position IDs to float to ensure correct dtype propagation
+				pos_ids = jnp.arange(seq_len, dtype=jnp.float32)
+				kwargs['rope'] = rope.compute_freqs(pos_ids)
 
-		Returns:
-			Loaded LlamaModel instance
-		"""
-		return from_pretrained(cls, model_path, rngs, dtype, abstract)
+		# Create attention mask and position IDs for all layers
+		if 'position_ids' not in kwargs:
+			# Default to sequential positions
+			kwargs['position_ids'] = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+			kwargs['position_ids'] = jnp.broadcast_to(kwargs['position_ids'], (batch_size, seq_len))
+
+		query_positions = kwargs.get('query_positions', kwargs['position_ids'])
+		kv_positions = kwargs.get('kv_positions', kwargs['position_ids'])
+
+		# Import kvax components
+		from kvax.ops import create_attention_mask
+		from kvax.utils.common import FlashAttentionParamsConfig
+		from ueaj.utils.kvax_context import get_kvax_context
+
+		# Get kvax context
+		kvax_ctx = get_kvax_context()
+
+		# Create attention mask once for all layers
+		with kvax_ctx():
+			# Create flash attention params
+			fwd_params = FlashAttentionParamsConfig(
+				query_block_size=64,
+				kv_block_size=64,
+				num_warps=4,
+				num_stages=3
+			)
+			bwd_params = FlashAttentionParamsConfig(
+				query_block_size=64,
+				kv_block_size=64,
+				num_warps=4,
+				num_stages=3
+			)
+
+			# Create attention mask
+			attention_mask = create_attention_mask(
+				query_positions=query_positions,
+				query_segment_ids=kwargs['query_segment_ids'],
+				kv_positions=kv_positions,
+				kv_segment_ids=kwargs['kv_segment_ids'],
+				calc_bwd_mask=True,  # Required for gradient computation
+				fwd_params=fwd_params,
+				bwd_params=bwd_params,
+			)
+
+		kwargs['attention_mask'] = attention_mask
+		kwargs['query_positions'] = query_positions
+		kwargs['kv_positions'] = kv_positions
+
+		return kwargs
+

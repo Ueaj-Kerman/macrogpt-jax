@@ -10,6 +10,3 @@ __pycache__/
 *.pyc
 wandb/
 hf_token.py
-
-ueaj/opt/block
-ueaj/opt/multiscale.py

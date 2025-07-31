@@ -14,62 +14,64 @@ def _normalize_dtype(dtype: Any):
 	return dtypes.canonicalize_dtype(dtype)
 
 
-def astype_fwd_noop_bwd(x: jax.Array, dtype: Any) -> jax.Array:
+def custom_astype(x: jax.Array, dtype: Any, cast_forward: bool = True, cast_backward: bool = True) -> jax.Array:
 	"""
-	Custom astype that preserves gradient dtype in backwards pass.
+	Custom astype with control over forward and backward pass casting.
 
-	Forward pass: converts x from its original dtype to target dtype
-	Backward pass: keeps gradients in whatever dtype they come in (no recasting)
+	Args:
+		x: Input array
+		dtype: Target dtype
+		cast_forward: If True, cast to dtype in forward pass
+		cast_backward: If True, cast gradients to dtype in backward pass
 
-	This avoids issues where fp8->fp16 casting in forward pass would
-	try to cast fp16 gradients back to fp8 in backward pass.
+	Returns:
+		Array potentially casted to dtype based on flags
+
+	Examples:
+		# Old astype_fwd_noop_bwd:
+		custom_astype(x, dtype, cast_forward=True, cast_backward=False)
+		
+		# Old noop_fwd_astype_bwd:
+		custom_astype(x, dtype, cast_forward=False, cast_backward=True)
 	"""
 	# Convert dtype outside the custom_vjp to avoid argument issues
 	jax_dtype = _normalize_dtype(dtype)
 
 	@jax.custom_vjp
-	def _astype_preserve_grad(x_inner):
-		return lax.convert_element_type(x_inner, jax_dtype)
+	def _custom_astype(x_inner):
+		if cast_forward:
+			return lax.convert_element_type(x_inner, jax_dtype)
+		else:
+			return x_inner
 
 	def _fwd(x_inner):
-		# Forward: convert to target dtype, don't save anything (we won't need it)
-		y = lax.convert_element_type(x_inner, jax_dtype)
+		# Forward: conditionally convert based on cast_forward
+		if cast_forward:
+			y = lax.convert_element_type(x_inner, jax_dtype)
+		else:
+			y = x_inner
 		return y, None
 
 	def _bwd(_, g):
-		# Backward: return gradient as-is, don't cast back to original dtype
-		return (g,)
+		# Backward: conditionally cast gradient based on cast_backward
+		if cast_backward:
+			return (lax.convert_element_type(g, jax_dtype),)
+		else:
+			return (g,)
 
-	_astype_preserve_grad.defvjp(_fwd, _bwd)
-	return _astype_preserve_grad(x)
+	_custom_astype.defvjp(_fwd, _bwd)
+	return _custom_astype(x)
+
+
+# Compatibility aliases
+def astype_fwd_noop_bwd(x: jax.Array, dtype: Any) -> jax.Array:
+	"""Legacy function - use custom_astype(x, dtype, cast_forward=True, cast_backward=False) instead."""
+	return custom_astype(x, dtype, cast_forward=True, cast_backward=False)
 
 
 def noop_fwd_astype_bwd(x: jax.Array, dtype: Any) -> jax.Array:
-	"""
-	Custom astype that does nothing in forward pass but casts in backward pass.
-
-	Forward pass: returns x unchanged (no dtype conversion)
-	Backward pass: casts gradients to the specified dtype
-
-	This is the opposite of astype_fwd_noop_bwd.
-	"""
-	# Convert dtype outside the custom_vjp to avoid argument issues
-	jax_dtype = _normalize_dtype(dtype)
-
-	@jax.custom_vjp
-	def _noop_fwd_astype_bwd(x_inner):
-		return x_inner
-
-	def _fwd(x_inner):
-		# Forward: return as-is, save original dtype for backward
-		return x_inner, None
-
-	def _bwd(orig_dtype, g):
-		# Backward: cast gradient to target dtype
-		return (lax.convert_element_type(g, jax_dtype),)
-
-	_noop_fwd_astype_bwd.defvjp(_fwd, _bwd)
-	return _noop_fwd_astype_bwd(x)
+	"""Legacy function - use custom_astype(x, dtype, cast_forward=False, cast_backward=True) instead."""
+	return custom_astype(x, dtype, cast_forward=False, cast_backward=True)
 
 
 def identity_grad(x: jax.Array, lambda_: float | jax.Array = .1):
@@ -87,59 +89,57 @@ def identity_grad(x: jax.Array, lambda_: float | jax.Array = .1):
 	return _igrad(x)
 
 
-def debug_dtype(x: jax.Array, name: str = "tensor") -> jax.Array:
+def debug_tensor(x: jax.Array, name: str = "tensor", show_values: bool = False) -> jax.Array:
 	"""
-	Debug version of astype that prints dtype information in forward and backward passes.
-
-	Forward pass: converts x from its original dtype to target dtype and prints info
-	Backward pass: keeps gradients in whatever dtype they come in and prints info
+	Debug function that prints tensor information in forward and backward passes.
 
 	Args:
 		x: Input array
-		dtype: Target dtype for forward pass
-		name: Optional name for the tensor being tracked (for clearer debug output)
+		name: Name for the tensor being tracked (for clearer debug output)
+		show_values: If True, also print RMS values of the tensor/gradient
 
 	Returns:
-		Array with converted dtype
+		Input array unchanged (identity function with debug prints)
+
+	Examples:
+		# Old debug_dtype:
+		debug_tensor(x, name="my_tensor", show_values=False)
+		
+		# Old debug_grad_flow:
+		debug_tensor(x, name="my_tensor", show_values=True)
 	"""
 
 	@jax.custom_vjp
-	def _debug_astype(x_inner):
+	def _debug_tensor(x_inner):
 		return x_inner
 
-	def _fwd(x):
-		# Forward: convert to target dtype
-		print(f"[FWD] {name}: dtype = {x.dtype}")
-		return x, None
+	def _fwd(x_inner):
+		# Forward: print debug info
+		print(f"[FWD] {name}: dtype = {x_inner.dtype}")
+		if show_values:
+			jax.debug.print("[FWD] {}: {}", name, jnp.sqrt(jnp.square(x_inner).mean()))
+		return x_inner, None
 
 	def _bwd(_, g):
-		# Backward: return gradient as-is and print debug info
+		# Backward: print gradient info
 		print(f"[BWD] {name}: dtype = {g.dtype}")
+		if show_values:
+			jax.debug.print("[BWD] {}: {}", name, jnp.sqrt(jnp.square(g).mean()))
 		return (g,)
 
-	_debug_astype.defvjp(_fwd, _bwd)
-	return _debug_astype(x)
+	_debug_tensor.defvjp(_fwd, _bwd)
+	return _debug_tensor(x)
+
+
+# Compatibility aliases
+def debug_dtype(x: jax.Array, name: str = "tensor") -> jax.Array:
+	"""Legacy function - use debug_tensor(x, name, show_values=False) instead."""
+	return debug_tensor(x, name, show_values=False)
 
 
 def debug_grad_flow(x: jax.Array, name: str = "tensor") -> jax.Array:
-	@jax.custom_vjp
-	def _debug_astype(x_inner):
-		return x_inner
-
-	def _fwd(x):
-		# Forward: convert to target dtype
-		print(f"[FWD] {name}: dtype = {x.dtype}")
-		jax.debug.print("[FWD] {}: {}", name, jnp.sqrt(jnp.square(x).mean()))
-		return x, None
-
-	def _bwd(_, g):
-		# Backward: return gradient as-is and print debug info
-		print(f"[BWD] {name}: dtype = {g.dtype}")
-		jax.debug.print("[BWD] {}: {}", name, jnp.sqrt(jnp.square(g).mean()))
-		return (g,)
-
-	_debug_astype.defvjp(_fwd, _bwd)
-	return _debug_astype(x)
+	"""Legacy function - use debug_tensor(x, name, show_values=True) instead."""
+	return debug_tensor(x, name, show_values=True)
 
 
 def te_gradient_workaround(x: jax.Array) -> jax.Array:

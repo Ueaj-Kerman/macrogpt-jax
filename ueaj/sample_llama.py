@@ -13,7 +13,8 @@ from flax import nnx
 from transformers import AutoTokenizer
 from huggingface_hub import snapshot_download, HfFolder
 
-from ueaj.model.llama import LlamaModel
+from ueaj.model.model import LlamaModel
+from ueaj.llama.weight_loader import from_pretrained
 
 
 def sample_from_logits(
@@ -279,7 +280,8 @@ def main():
     print(f"Using dtype: {args.dtype}")
     print(f"Using KV cache: {args.use_cache}")
     
-    model = LlamaModel.from_pretrained(
+    model = from_pretrained(
+        LlamaModel,
         model_path,
         dtype=dtype,
         abstract=False,
