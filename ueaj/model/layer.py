@@ -1,8 +1,11 @@
+import jax
+
 from ueaj.model.soft_attn import *
 from ueaj.model.mlp import *
 from ueaj.model.rmsnorm import *
 from ueaj.utils.configurator import *
 
+TENSOR_SHARDING = jax.P(("batch", "sequence", "tensor"))
 
 @config
 class TransformerLayer(nnx.Module):
@@ -14,23 +17,25 @@ class TransformerLayer(nnx.Module):
 
 	def __init__(self, 
 		model_d: int,
-		rngs: rng.Rngs,
 		attn: Callable = SoftmaxAttention,
 		mlp: Callable = GMLP,
 		norm: Callable = RMSNorm,
+		*,
+		rngs: rng.Rngs,
+		mesh: Optional[jax.sharding.Mesh] = None,
 	):
 		super().__init__()
 		
 		# Initialize components directly - they should be pre-configured with override
-		self.attn = attn(model_d=model_d, rngs=rngs)
-		self.mlp = mlp(model_d=model_d, rngs=rngs)
-		self.attn_norm = norm(model_d=model_d, rngs=rngs)
-		self.mlp_norm = norm(model_d=model_d, rngs=rngs)
+		self.attn = attn(model_d=model_d, rngs=rngs, mesh=mesh)
+		self.mlp = mlp(model_d=model_d, rngs=rngs, mesh=mesh)
+		self.attn_norm = norm(model_d=model_d, rngs=rngs, mesh=mesh)
+		self.mlp_norm = norm(model_d=model_d, rngs=rngs, mesh=mesh)
 		
 		# Store model dimension
 		self.model_d = model_d
 
-	def __call__(self, x, **kwargs):
+	def __call__(self, x, mesh: Optional[jax.sharding.Mesh] = None, **kwargs):
 		"""
 		Forward pass through the transformer layer.
 
@@ -45,4 +50,6 @@ class TransformerLayer(nnx.Module):
 		# Use TransformerEngine workaround for attention normalization
 		x += self.attn(self.attn_norm(x), **kwargs)
 		x += self.mlp(self.mlp_norm(x))
+		if mesh is not None:
+			x = jax.lax.with_sharding_constraint(x, jax.NamedSharding(mesh, TENSOR_SHARDING))
 		return x

@@ -6,7 +6,6 @@ from jax import lax, dtypes
 from typing import Any, NamedTuple, Callable
 from flax import nnx
 from flax.nnx import rnglib as rng
-from orbax.checkpoint.checkpoint_utils import PLACEHOLDER
 
 
 def _normalize_dtype(dtype: Any):

@@ -1,5 +1,4 @@
 """Custom activation functions."""
-
 import jax.numpy as jnp
 
 
@@ -15,3 +14,16 @@ def leaky_relu_squared(x):
         Activated tensor
     """
     return jnp.where(x < 0, -0.0625, 1) * jnp.square(x)
+
+def signed_sqrt(x):
+    """Signed square root activation function.
+
+    Applies sqrt(x) for positive values and -sqrt(-x) for negative values.
+
+    Args:
+        x: Input tensor
+
+    Returns:
+        Activated tensor
+    """
+    return jnp.where(x < 0, -jnp.sqrt(-x), jnp.sqrt(x))

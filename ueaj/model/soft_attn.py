@@ -4,17 +4,16 @@ from typing import *
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from flax import nnx
 from flax.nnx import rnglib as rng
 
-from kvax.ops import flash_attention
+from kvax.ops.flash_attention_clean import flash_attention
 
 from ueaj.model.einsum import *
 from ueaj.model import rope
 from ueaj.utils import gradutils as gu
 from ueaj.utils.configurator import *
-
-
 
 
 @config
@@ -36,7 +35,6 @@ class SoftmaxAttention(nnx.Module, ABC):
 	
 	def __init__(self, 
 		model_d: int,
-		rngs: rng.Rngs,
 		kq_d: int = 64,  # Good default head dimension
 		kv_heads: int | None = None,  # Will default to model_d // kq_d
 		kv_q_ratio: int = 1,
@@ -46,7 +44,11 @@ class SoftmaxAttention(nnx.Module, ABC):
 		k: Callable = Einsum,
 		v: Callable = Einsum,
 		q: Callable = Einsum,
-		o: Callable = Einsum
+		o: Callable = Einsum,
+		attn_scale: float | Literal['mup', 'sp'] = 'sp',
+		*,
+		rngs: rng.Rngs,
+		mesh: Optional[jax.sharding.Mesh] = None
 	):
 		super().__init__()
 		
@@ -81,14 +83,18 @@ class SoftmaxAttention(nnx.Module, ABC):
 			nnx.initializers.lecun_normal(),
 			size_dict,
 			rngs=rngs,
-			dtype=jnp.bfloat16
+			dtype=jnp.bfloat16,
+			mesh=mesh,
+			sharding=(None, 'tensor', None)
 		)
 		self.v = v(
 			"bnd,dhv->bnhv",
 			nnx.initializers.lecun_normal(),
 			size_dict,
 			rngs=rngs,
-			dtype=jnp.bfloat16
+			dtype=jnp.bfloat16,
+			mesh=mesh,
+			sharding=(None, 'tensor', None)
 		)
 		# Q projection with group query attention (i dimension)
 		self.q = q(
@@ -96,24 +102,39 @@ class SoftmaxAttention(nnx.Module, ABC):
 			nnx.initializers.lecun_normal(),
 			size_dict,
 			rngs=rngs,
-			dtype=jnp.bfloat16
+			dtype=jnp.bfloat16,
+			mesh=mesh,
+			sharding=(None, 'tensor', None, None)
 		)
-		
+
+
+		if mesh and size_dict['i']*size_dict['v']*(size_dict['h'] // mesh.shape['tensor']) > size_dict['d']:
+			# down project first to save memory then ring reduce
+			down_shards = ('tensor', None, None, None)
+		else:
+			# perform attention first then ring matmul
+			down_shards = (None, None, None, 'tensor')
+
 		# Output projection with zero initialization and batch dims
 		self.o = o(
 			"bnhiv,hivd->bnd",
 			nnx.initializers.zeros_init(),
 			size_dict,
 			rngs=rngs,
-			dtype=jnp.bfloat16
+			dtype=jnp.bfloat16,
+			mesh=mesh,
+			sharding=down_shards
 		)
+
+		self.attn_scale = attn_scale
 
 		# Create RoPE if theta provided
 		if rope_theta is not None:
 			self.rope = rope.RoPE(rope_theta=rope_theta, rope_d=kq_d, value_dtype=jnp.bfloat16)
 		else:
 			self.rope = None
-	
+
+
 	@property
 	def config(self):
 		"""For backwards compatibility with code that accesses self.config"""
@@ -157,9 +178,13 @@ class SoftmaxAttention(nnx.Module, ABC):
 		kv_segment_ids = kwargs.get('kv_segment_ids', query_segment_ids)
 		
 		# Apply flash attention with proper scaling
-		# Scale by 1/sqrt(head_dim) for standard attention
-		# Cast to float32 to avoid Triton fp64 issues
-		scale = np.float32(1.0 / (self.kq_d ** 0.5))
+		if self.attn_scale == 'mup':
+			scale = np.float32(1.0 / self.kq_d)
+		elif self.attn_scale == 'sp':
+			scale = np.float32(1.0 / (self.kq_d ** 0.5))
+		else:
+			scale = self.attn_scale
+
 		out = flash_attention(
 			query=q_reshaped,
 			key=k,
@@ -180,3 +205,20 @@ class SoftmaxAttention(nnx.Module, ABC):
 		y = self.o(out)
 		return y
 
+if __name__ == "__main__":
+	# attn = nnx.eval_shape(lambda: SoftmaxAttention(
+	# 	1024,
+	# 	rngs=rng.Rngs(0),
+	# ))
+	# state = nnx.state(attn, nnx.Param)
+	# jax.tree.map(print, state)
+	test = {
+		"common": jnp.ones((10, 10)),
+		"exception": jnp.ones((10, 10)),
+	}
+
+	test2 = {
+		"common": jnp.ones((10, 10)),
+	}
+
+	jax.tree.map(lambda x: print(x.shape), test2, test)

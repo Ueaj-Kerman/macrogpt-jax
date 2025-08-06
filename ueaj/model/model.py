@@ -3,10 +3,8 @@ Llama model implementation for loading and running Llama models from HuggingFace
 """
 
 from ueaj.model.layer import *
-from ueaj.llama.weight_loader import *
 from ueaj.model.rmsnorm import *
 from ueaj.utils.configurator import *
-
 
 @config
 class LlamaModel(nnx.Module):
@@ -30,12 +28,14 @@ class LlamaModel(nnx.Module):
 		vocab_size: int,
 		model_d: int, 
 		num_layers: int,
-		rngs: rng.Rngs,
 		tie_word_embeddings: bool = False,
 		transformer_layer: Callable = TransformerLayer,
 		norm: Callable = RMSNorm,
 		embed: Callable = nnx.Embed,
-		**kwargs  # Pass through to components
+		head_cap: str = 'tanh',
+		*,
+		rngs: rng.Rngs,
+		mesh: Optional[jax.sharding.Mesh] = None,
 	):
 		super().__init__()
 		# Store necessary config
@@ -43,21 +43,28 @@ class LlamaModel(nnx.Module):
 		self.model_d = model_d
 		self.num_layers = num_layers
 		self.tie_word_embeddings = tie_word_embeddings
+		self.mesh = mesh
 		
 		# Extract some kwargs for local use
-		self.max_position_embeddings = kwargs.get('max_position_embeddings', 131072)
-		self.head_cap = kwargs.get('head_cap', 'tanh')
+		self.head_cap = head_cap
 
 		# Token embeddings - invoke embed callable with defaults
-		embed_dtype = kwargs.get('param_dtype', jnp.bfloat16)
 		self.embed_tokens = embed(
 			num_embeddings=vocab_size,
 			features=model_d,
-			dtype=embed_dtype,
-			param_dtype=embed_dtype,
+			dtype=jnp.bfloat16,
+			param_dtype=jnp.bfloat16,
 			embedding_init=nnx.initializers.normal(stddev=1.0),
 			rngs=rngs
 		)
+		
+		# Apply sharding to embeddings if mesh is provided
+		if mesh is not None:
+			partition_spec = jax.sharding.PartitionSpec('tensor', None)
+			named_sharding = jax.NamedSharding(mesh, partition_spec)
+			self.embed_tokens.embedding.value = jax.lax.with_sharding_constraint(
+				self.embed_tokens.embedding.value, named_sharding
+			)
 
 		# Create transformer layers
 		@nnx.split_rngs(splits=num_layers)
@@ -65,33 +72,31 @@ class LlamaModel(nnx.Module):
 		def create_block(rngs: nnx.Rngs):
 			return transformer_layer(
 				model_d=model_d,
-				rngs=rngs
+				rngs=rngs,
+				mesh=mesh
 			)
 		self.layers = create_block(rngs)
 
 		# Final layer norm - invoke norm callable
-		self.norm = norm(model_d=model_d, rngs=rngs)
+		self.norm = norm(model_d=model_d, rngs=rngs, mesh=mesh)
 
 		# Output projection (lm_head) - only if not tied
 		if not tie_word_embeddings:
-			self.lm_head = nnx.Linear(
-				in_features=model_d,
-				out_features=vocab_size,
-				use_bias=False,
-				dtype=embed_dtype,
-				param_dtype=embed_dtype,
-				kernel_init=nnx.initializers.zeros,
-				rngs=rngs
+			# Use Einsum for lm_head
+			self.lm_head = Einsum(
+				"bnd,dv->bnv",
+				nnx.initializers.zeros_init(),
+				size_dict={'d': model_d, 'v': vocab_size},
+				rngs=rngs,
+				dtype=jnp.bfloat16,
+				mesh=mesh,
+				sharding=(None, 'tensor')
 			)
 		else:
 			self.lm_head = None
 	
-	@property
-	def config(self):
-		"""For backwards compatibility."""
-		return self
 
-	def get_activations(self, input_ids: jax.Array, **kwargs) -> jax.Array:
+	def get_activations(self, input_ids: jax.Array, mesh: Optional[jax.sharding.Mesh] = None, **kwargs) -> jax.Array:
 		"""
 		Get hidden states without final norm and lm_head projection.
 
@@ -101,24 +106,25 @@ class LlamaModel(nnx.Module):
 
 		Returns:
 			Hidden states of shape (batch_size, sequence_length, model_d)
+			:param input_ids:
+			:param mesh:
 		"""
 		# Embed tokens
 		act0 = self.embed_tokens(input_ids)
 
 		kwargs = self.default_kwargs(*input_ids.shape, **kwargs)
 
-		# Import kvax context
-		from ueaj.utils.kvax_context import get_kvax_context
-		kvax_ctx = get_kvax_context()
-		
-		# Run all layers within kvax context
-		with kvax_ctx():
-			@nnx.split_rngs(splits=self.config.num_layers)
-			@nnx.scan
-			@nnx.remat(policy=jax.checkpoint_policies.nothing_saveable)
-			def scan(act, layer):
-				return layer(act, **kwargs), None
-			act, _ = scan(act0, self.layers)
+		# Run all layers
+		@nnx.split_rngs(splits=self.num_layers)
+		@nnx.scan
+		@nnx.remat(policy=jax.checkpoint_policies.nothing_saveable)
+		def scan(act, layer):
+			return layer(act, mesh=mesh, **kwargs), None
+
+		if mesh is not None:
+			act0 = jax.lax.with_sharding_constraint(act0, jax.NamedSharding(mesh, TENSOR_SHARDING))
+
+		act, _ = scan(act0, self.layers)
 
 		# if self.config.head_recenter == "recenter":
 		# 	act = act - act0
@@ -139,15 +145,15 @@ class LlamaModel(nnx.Module):
 		activations = self.norm(activations)
 
 		# Project to vocabulary
-		if self.config.tie_word_embeddings:
+		if self.tie_word_embeddings:
 			# Use embedding's attend method for tied embeddings
 			logits = self.embed_tokens.attend(activations)
 		else:
 			# Use separate lm_head
 			logits = self.lm_head(activations)
 
-		if self.config.head_cap == "tanh":
-			logits = 15*jnp.tanh(logits/(15 * jnp.sqrt(self.config.model_d)))
+		if self.head_cap == "tanh":
+			logits = 15*jnp.tanh(logits/(15 * jnp.sqrt(self.model_d)))
 
 		return logits
 
@@ -192,44 +198,53 @@ class LlamaModel(nnx.Module):
 		query_positions = kwargs.get('query_positions', kwargs['position_ids'])
 		kv_positions = kwargs.get('kv_positions', kwargs['position_ids'])
 
-		# Import kvax components
-		from kvax.ops import create_attention_mask
+		# Import kvax components using the new clean API
+		from kvax.ops.flash_attention_clean import create_attention_mask
 		from kvax.utils.common import FlashAttentionParamsConfig
-		from ueaj.utils.kvax_context import get_kvax_context
 
-		# Get kvax context
-		kvax_ctx = get_kvax_context()
+		# Create flash attention params
+		fwd_params = FlashAttentionParamsConfig(
+			query_block_size=64,
+			kv_block_size=64,
+			num_warps=4,
+			num_stages=3
+		)
+		bwd_params = FlashAttentionParamsConfig(
+			query_block_size=64,
+			kv_block_size=64,
+			num_warps=4,
+			num_stages=3
+		)
 
-		# Create attention mask once for all layers
-		with kvax_ctx():
-			# Create flash attention params
-			fwd_params = FlashAttentionParamsConfig(
-				query_block_size=64,
-				kv_block_size=64,
-				num_warps=4,
-				num_stages=3
-			)
-			bwd_params = FlashAttentionParamsConfig(
-				query_block_size=64,
-				kv_block_size=64,
-				num_warps=4,
-				num_stages=3
-			)
-
-			# Create attention mask
-			attention_mask = create_attention_mask(
-				query_positions=query_positions,
-				query_segment_ids=kwargs['query_segment_ids'],
-				kv_positions=kv_positions,
-				kv_segment_ids=kwargs['kv_segment_ids'],
-				calc_bwd_mask=True,  # Required for gradient computation
-				fwd_params=fwd_params,
-				bwd_params=bwd_params,
-			)
+		# Create attention mask using the new API - no context manager needed
+		attention_mask = create_attention_mask(
+			query_positions=query_positions,
+			query_segment_ids=kwargs['query_segment_ids'],
+			kv_positions=kv_positions,
+			kv_segment_ids=kwargs['kv_segment_ids'],
+			calc_bwd_mask=True,  # Required for gradient computation
+			fwd_params=fwd_params,
+			bwd_params=bwd_params,
+		)
 
 		kwargs['attention_mask'] = attention_mask
 		kwargs['query_positions'] = query_positions
 		kwargs['kv_positions'] = kv_positions
 
 		return kwargs
+	
+	def reshard(self, mesh: jax.sharding.Mesh) -> None:
+		"""Reshard the embedding tokens along the vocabulary dimension.
+		
+		Args:
+			mesh: JAX mesh to shard on
+		"""
+		# Reshard embeddings - shard along vocabulary dimension
+		if hasattr(self.embed_tokens, 'embedding'):
+			# Standard nnx.Embed
+			partition_spec = jax.sharding.PartitionSpec('tensor', None)
+			named_sharding = jax.NamedSharding(mesh, partition_spec)
+			self.embed_tokens.embedding.value = jax.lax.with_sharding_constraint(
+				self.embed_tokens.embedding.value, named_sharding
+			)
 

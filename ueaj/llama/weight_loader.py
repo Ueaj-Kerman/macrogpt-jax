@@ -213,40 +213,59 @@ def load_weights_from_safetensors(model, safetensor_files):
     return loaded_keys, skipped_keys
 
 
-def load_config_from_hf(model_id: str) -> Dict[str, Any]:
-    """Load config from HuggingFace model and return as dict."""
+def create_llama_model_config(model_id: str, dtype: Optional[jax.typing.DTypeLike] = None):
+    """Create a configured LlamaModel class using HuggingFace config and override API."""
     from transformers import LlamaConfig as HFLlamaConfig
+    from ueaj.model import SoftmaxAttention, GMLP, TransformerLayer, LlamaModel, RMSNorm
 
     # Load config using transformers
     hf_config = HFLlamaConfig.from_pretrained(model_id)
 
     kv_heads = getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads)
     model_d = hf_config.hidden_size
-    # Get dtype directly from the config
-    param_dtype = jax.dtypes.canonicalize_dtype(hf_config.torch_dtype)
+    
+    # Get dtype
+    if dtype is None:
+        dtype = jax.dtypes.canonicalize_dtype(hf_config.torch_dtype)
 
-    # Return config as dict
-    return {
-        'vocab_size': hf_config.vocab_size,
-        'model_d': model_d,
-        'num_layers': hf_config.num_hidden_layers,
-        'max_position_embeddings': hf_config.max_position_embeddings,
-        'rms_norm_eps': getattr(hf_config, "rms_norm_eps", 1e-5),
-        'tie_word_embeddings': getattr(hf_config, "tie_word_embeddings", False),
-        'mlp_type': "gated",
-        # Attention parameters
-        'kq_d': hf_config.head_dim,
-        'v_head_d': hf_config.head_dim,
-        'kv_heads': kv_heads,
-        'kv_q_ratio': hf_config.num_attention_heads // kv_heads,
-        'rope_theta': getattr(hf_config, "rope_theta", 10000.0),
-        # MLP parameters
-        'hidden_d': hf_config.intermediate_size,
-        # Normalization
-        'norm_scale': "uncentered",
-        'head_recenter': "none",
-        'head_cap': "none",
-    }
+    # Create configured model class using override API
+    return LlamaModel.override(
+        vocab_size=hf_config.vocab_size,
+        model_d=model_d,
+        num_layers=hf_config.num_hidden_layers,
+        max_position_embeddings=hf_config.max_position_embeddings,
+        tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
+        param_dtype=dtype,
+        # Configure transformer layer
+        transformer_layer=TransformerLayer.override(
+            # Configure attention
+            attn=SoftmaxAttention.override(
+                kq_d=hf_config.head_dim,
+                kv_heads=kv_heads,
+                kv_q_ratio=hf_config.num_attention_heads // kv_heads,
+                rope_theta=getattr(hf_config, "rope_theta", 10000.0),
+                attention_scale='sp',  # Use SP scaling for LLaMA models
+                param_dtype=dtype
+            ),
+            # Configure MLP
+            mlp=GMLP.override(
+                hidden_d=hf_config.intermediate_size,
+                param_dtype=dtype
+            ),
+            # Configure normalization
+            norm=RMSNorm.override(
+                eps=getattr(hf_config, "rms_norm_eps", 1e-5),
+                scale="uncentered",
+                param_dtype=dtype
+            )
+        ),
+        # Configure final norm
+        norm=RMSNorm.override(
+            eps=getattr(hf_config, "rms_norm_eps", 1e-5),
+            scale="uncentered",
+            param_dtype=dtype
+        )
+    )
 
 
 def from_pretrained(
@@ -260,7 +279,7 @@ def from_pretrained(
     Load a pretrained Llama model from safetensors files.
 
     Args:
-        model_class: The model class to instantiate
+        model_class: The model class to instantiate (ignored, uses LlamaModel)
         model_path: Path to directory containing safetensors files
         rngs: Random number generators
         dtype: Data type for model parameters
@@ -274,17 +293,14 @@ def from_pretrained(
     if rngs is None:
         rngs = rng.Rngs(0)
 
-    # Load config as dict
-    config = load_config_from_hf(model_path)
+    # Create configured model class using override API
+    configured_model_class = create_llama_model_config(model_path, dtype)
 
-    if dtype is not None:
-        config['param_dtype'] = dtype
-
-    # Create model with config
+    # Create model instance
     if abstract:
-        model = nnx.eval_shape(lambda: model_class(rngs=rng.Rngs(0), **config))
+        model = nnx.eval_shape(lambda: configured_model_class(rngs=rng.Rngs(0)))
     else:
-        model = model_class(rngs=rngs, **config)
+        model = configured_model_class(rngs=rngs)
 
     # Load weights from safetensors
     model_dir = Path(model_path)

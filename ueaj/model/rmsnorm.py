@@ -18,16 +18,20 @@ class RMSNorm(nnx.Module):
 
 	def __init__(self,
 		model_d: int,
-		rngs: nnx.Rngs,
 		scale_mode: Literal['centered', 'uncentered', 'scalar', 'none'] = 'centered',
 		eps: float = 1e-6,
 		param_dtype: jnp.dtype = jnp.bfloat16,
 		initializer: Optional[Callable] = None,
+		*,
+		rngs: nnx.Rngs,
+		mesh: Optional[jax.sharding.Mesh] = None,
+		sharding: Optional[str | None] = 'tensor',
 	):
 		super().__init__()
 		self.eps = eps
 		self.scale = None
 		self.recenter = False
+		self.sharding = sharding
 
 		if scale_mode == 'none':
 			return
@@ -52,7 +56,16 @@ class RMSNorm(nnx.Module):
 		if initializer is None:
 			initializer = default_init
 
-		self.scale = nnx.Param(initializer(rngs.param(), shape, param_dtype))
+		# Initialize scale parameter
+		scale_value = initializer(rngs.param(), shape, param_dtype)
+		
+		# Apply sharding if mesh is provided
+		if mesh is not None and shape != ():  # Can't shard scalar
+			partition_spec = jax.sharding.PartitionSpec(sharding)
+			named_sharding = jax.NamedSharding(mesh, partition_spec)
+			scale_value = jax.lax.with_sharding_constraint(scale_value, named_sharding)
+		
+		self.scale = nnx.Param(scale_value)
 
 	def __call__(self, x):
 		input_dtype = x.dtype
@@ -71,5 +84,27 @@ class RMSNorm(nnx.Module):
 				x = x * scale
 		
 		return x.astype(input_dtype)
+	
+	def reshard(self, mesh: jax.sharding.Mesh) -> None:
+		"""Reshard the scale parameter on the given mesh.
+		
+		Args:
+			mesh: JAX mesh to shard on
+		"""
+		if self.scale is None:
+			# No scale parameter to reshard (scale_mode='none')
+			return
+		
+		# Handle scalar scale (shape=())
+		if self.scale.value.shape == ():
+			# Scalar can't be sharded, just replicate
+			partition_spec = jax.sharding.PartitionSpec()
+		else:
+			# Vector scale (shape=(model_d,))
+			partition_spec = jax.sharding.PartitionSpec(self.sharding)
+		
+		# Apply sharding constraint
+		named_sharding = jax.NamedSharding(mesh, partition_spec)
+		self.scale.value = jax.lax.with_sharding_constraint(self.scale.value, named_sharding)
 
 
