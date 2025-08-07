@@ -1,4 +1,4 @@
-jax[cuda12]~=0.7.0
+jax[cuda12_local]~=0.7.0
 flax~=0.10.6
 datasets~=3.6.0
 huggingface_hub~=0.33.0
@@ -8,7 +8,7 @@ numpy~=2.3.1
 optax~=0.2.5
 safetensors~=0.5.3
 
-https://storage.googleapis.com/www.ueaj.dev/python/kvax-0.1.0-py3-none-any.whl
-jax-triton>=0.2.0
-triton>=3.1
-chex>=0.1.85
+https://storage.googleapis.com/www.ueaj.dev/python/kvax-0.1.1-py3-none-any.whl
+jax-triton~=0.3.0
+triton~=3.3.1
+chex~=0.1.85

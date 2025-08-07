@@ -15,8 +15,8 @@ class MLP(nnx.Module):
         hidden_d: int | None = None,  # Defaults to 4 * model_d
         act_fn: Callable[[jax.Array], jax.Array] = nnx.swish,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        up_proj_class: Callable = Einsum,
-        down_proj_class: Callable = Einsum,
+        up_proj: Callable = Einsum,
+        down_proj: Callable = Einsum,
         *,
         rngs: rng.Rngs,
         mesh: Optional[jax.sharding.Mesh] = None
@@ -27,19 +27,18 @@ class MLP(nnx.Module):
         size_dict = {'d': model_d, 'h': hidden_d}
         
         # Create projections with LeCun initialization
-        self.up_proj = up_proj_class(
+        self.up_proj = up_proj(
             "bnd,dh->bnh",
-            nnx.initializers.lecun_normal(),
-            size_dict,
+            size_dict=size_dict,
             rngs=rngs,
             dtype=param_dtype,
             mesh=mesh,
             sharding=(None, 'tensor')
         )
-        self.down_proj = down_proj_class(
+        self.down_proj = down_proj(
             "bnh,hd->bnd",
-            nnx.initializers.zeros_init(),
-            size_dict,
+            initializer=zeros_init,
+            size_dict=size_dict,
             rngs=rngs,
             dtype=param_dtype,
             mesh=mesh,
@@ -61,8 +60,8 @@ class GMLP(nnx.Module):
         hidden_d: int | None = None,  # Defaults to 4 * model_d
         activation_fn: Callable[[jax.Array], jax.Array] = nnx.swish,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        fused_proj_class: Callable = Einsum,
-        down_proj_class: Callable = Einsum,
+        fused_proj: Callable = Einsum,
+        down_proj: Callable = Einsum,
         *,
         rngs: rng.Rngs,
         mesh: Optional[jax.sharding.Mesh] = None
@@ -73,26 +72,25 @@ class GMLP(nnx.Module):
         
         # Create fused gate/up projection with LeCun initialization
         size_dict_fused = {'d': model_d, 'h': hidden_d, 'i': 2}
-        self.fused_proj = fused_proj_class(
+        self.fused_proj = fused_proj(
             "bnd,idh->ibnh",
-            nnx.initializers.lecun_normal(),
-            size_dict_fused,
+            size_dict=size_dict_fused,
             batch_dims="i",
             rngs=rngs,
             dtype=param_dtype,
             mesh=mesh,
-            shards=(None, None, 'tensor')
+            sharding=(None, None, 'tensor')
         )
         
         size_dict = {'d': model_d, 'h': hidden_d}
-        self.down_proj = down_proj_class(
+        self.down_proj = down_proj(
             "bnh,hd->bnd",
-            nnx.initializers.zeros_init(),
-            size_dict,
+            initializer=zeros_init,
+            size_dict=size_dict,
             rngs=rngs,
             dtype=param_dtype,
             mesh=mesh,
-            shards=('tensor', None)
+            sharding=('tensor', None)
         )
         self.activation_fn = activation_fn
 

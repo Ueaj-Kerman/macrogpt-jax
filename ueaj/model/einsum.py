@@ -11,7 +11,57 @@ import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import rnglib as rng
 from ueaj.utils.configurator import *
+from ueaj.utils.gradutils import custom_scale
 from dataclasses import dataclass
+
+
+# Initializer type for Einsum
+InitializerFn = Callable[[int, int], nnx.initializers.Initializer]
+
+
+# Default initializer functions
+def lecun_normal_init(in_dims: int, out_dims: int) -> nnx.initializers.Initializer:
+	"""LeCun normal initializer (default for Einsum).
+	
+	Args:
+		in_dims: Number of input dimensions (reducing dims)
+		out_dims: Number of output dimensions (non-reducing dims)
+	
+	Returns:
+		Initializer with stddev = sqrt(1/in_dims)
+	"""
+	# For Einsum weights, the reducing dimensions are the input
+	# LeCun normal uses variance = 1/fan_in
+	# Since we're given the actual fan_in, we don't need to specify axes
+	# We use the default axes which work for 2D weights
+	return nnx.initializers.lecun_normal()
+
+
+def zeros_init(in_dims: int, out_dims: int) -> nnx.initializers.Initializer:
+	"""Zero initializer utility.
+	
+	Args:
+		in_dims: Number of input dimensions (reducing dims)
+		out_dims: Number of output dimensions (non-reducing dims)
+	
+	Returns:
+		Zero initializer
+	"""
+	return nnx.initializers.zeros_init()
+
+
+def scaled_normal_init(scale: float = 0.75) -> InitializerFn:
+	"""Creates a scaled normal initializer function.
+	
+	Args:
+		scale: Scale factor for the normal distribution
+	
+	Returns:
+		An initializer function that creates a normal initializer with the given scale
+	"""
+	def init_fn(in_dims: int, out_dims: int) -> nnx.initializers.Initializer:
+		return nnx.initializers.normal(stddev=scale)
+	return init_fn
 
 
 @dataclass
@@ -59,20 +109,20 @@ def compute_weight_metadata(
 	batch_dims_tuple = tuple(d for d in weight_expr if d in batch_dims_set)
 	reducing_dims_tuple = tuple(d for d in weight_expr if d in reducing_dims)
 	non_reducing_dims_tuple = tuple(d for d in weight_expr if d in non_reducing_dims)
-	
+
 	# Canonical shape (original einsum shape)
 	canonical_shape = tuple(size_dict[d] for d in weight_expr)
-	
+
 	# Reduced form dimensions
 	batch_shape = tuple(size_dict[d] for d in batch_dims_tuple)
 	reducing_shape = tuple(size_dict[d] for d in reducing_dims_tuple)
 	non_reducing_shape = tuple(size_dict[d] for d in non_reducing_dims_tuple)
-	
+
 	# Reduced shape (for optimizer)
 	reducing_size = reduce(operator.mul, reducing_shape, 1)
 	non_reducing_size = reduce(operator.mul, non_reducing_shape, 1)
 	reduced_shape = batch_shape + (reducing_size, non_reducing_size)
-	
+
 	# Compute transformation from canonical to reduced
 	# First reshape to separate batch/reducing/non-reducing
 	reordered = batch_dims_tuple + reducing_dims_tuple + non_reducing_dims_tuple
@@ -97,10 +147,11 @@ class Einsum(nnx.Module):
 	def __init__(
 		self,
 		expr: str,
-		initializer: nnx.initializers.Initializer,
-		size_dict: dict[str, int],
+		initializer: InitializerFn = lecun_normal_init,
+		size_dict: dict[str, int] = None,
 		batch_dims: str = "",
 		dtype: jnp.dtype = jnp.bfloat16,
+		static_scale: Optional[float] = None,
 		*,
 		rngs: rng.Rngs,
 		mesh: Optional[jax.sharding.Mesh] = None,
@@ -110,11 +161,13 @@ class Einsum(nnx.Module):
 
 		Args:
 			expr: Einsum expression (e.g., "bnd,fdh->fbnh")
-			initializer: Weight initializer
+			initializer: Initializer function that takes (in_dims, out_dims) and returns an initializer
 			size_dict: Mapping from dimension names to sizes
 			batch_dims: Batch dimensions in weight matrix (e.g., "f")
-			rngs: Random number generators
 			dtype: Parameter dtype (default: bfloat16)
+			static_scale: Optional static scaling factor to apply after matmul in forward,
+			             and before matmul in backward
+			rngs: Random number generators
 			mesh: JAX mesh
 			sharding: JAX sharding
 		"""
@@ -124,26 +177,39 @@ class Einsum(nnx.Module):
 		self.input_expr, self.weight_expr, self.output_expr = parse_einsum_expr(expr)
 		self.batch_dims = batch_dims
 		self.size_dict = size_dict
+		self.static_scale = static_scale
 
 		# Initialize weight with canonical shape
 
 		key = rngs.params()
-		
-		# Compute metadata to get canonical shape
+
+		# Compute metadata to get canonical shape and dimensions
 		temp_metadata = compute_weight_metadata(
 			self.weight_expr, self.output_expr, batch_dims, size_dict
 		)
 		canonical_shape = temp_metadata.canonical_shape
 		
-		w = initializer(key, canonical_shape, dtype)
+		# Calculate reducing and non-reducing dimensions
+		weight_set = set(self.weight_expr)
+		output_set = set(self.output_expr)
+		reducing_dims = weight_set - output_set
+		non_reducing_dims = weight_set - reducing_dims - set(batch_dims)
 		
+		# Calculate total size of reducing and non-reducing dimensions
+		reducing_size = reduce(operator.mul, [size_dict[d] for d in reducing_dims], 1)
+		non_reducing_size = reduce(operator.mul, [size_dict[d] for d in non_reducing_dims], 1)
+		
+		# Call the initializer function with dimensions
+		init = initializer(reducing_size, non_reducing_size)
+		w = init(key, canonical_shape, dtype)
+
 		if mesh is not None and sharding is not None:
 			partition_spec = jax.sharding.PartitionSpec(*sharding)
 			w = jax.lax.with_sharding_constraint(w, jax.NamedSharding(mesh, partition_spec))
 
 		self.sharding = sharding
 		self.w = nnx.Param(w)
-		
+
 		# Store metadata for optimizer transformations
 		self.metadata = compute_weight_metadata(
 			self.weight_expr, self.output_expr, batch_dims, size_dict
@@ -154,13 +220,28 @@ class Einsum(nnx.Module):
 
 	def __call__(self, x: jax.Array) -> jax.Array:
 		"""Apply einsum transformation."""
+
+		if self.static_scale is not None:
+			x = custom_scale(
+				x, self.static_scale,
+				scale_forward=False, scale_backward=True
+			)
+
 		# Weights are now stored in canonical form, use directly
-		return jnp.einsum(self.einsum_expr, x, self.w.value)
-	
+		x = jnp.einsum(self.einsum_expr, x, self.w.value)
+
+		if self.static_scale is not None:
+			x = custom_scale(
+				x, self.static_scale,
+				scale_forward=True, scale_backward=False
+			)
+
+		return x
+
 	def get_einsum_metadata(self) -> Dict[str, EinsumMetadata]:
 		"""Returns metadata for einsum-aware optimizers."""
 		return {'w': self.metadata}
-	
+
 	def reshard(self, mesh: jax.sharding.Mesh) -> None:
 		"""Reshard the weight parameter on the given mesh.
 		Args:
@@ -170,16 +251,16 @@ class Einsum(nnx.Module):
 		if sharding is None:
 			# Default to no sharding
 			sharding = (None,) * len(self.metadata.canonical_shape)
-		
+
 		if len(sharding) != len(self.metadata.canonical_shape):
 			raise ValueError(
 				f"Sharding spec length {len(sharding)} doesn't match "
 				f"weight dimensions {len(self.metadata.canonical_shape)}"
 			)
-		
+
 		# Create PartitionSpec from sharding
 		partition_spec = jax.sharding.PartitionSpec(*sharding)
-		
+
 		# Apply sharding constraint
 		named_sharding = jax.NamedSharding(mesh, partition_spec)
 		self.w.value = jax.lax.with_sharding_constraint(self.w.value, named_sharding)

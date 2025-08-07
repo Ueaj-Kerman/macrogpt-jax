@@ -64,10 +64,10 @@ def ueaj_model(vocab_size: int, model_d: int, num_layers: int, kq_ratio: int = 1
 				kv_heads=model_d // 128,
 				kv_q_ratio=kq_ratio,
 				rope_theta=2_000.0,
-				act_fn=leaky_relu_squared
+				act_fn=leaky_relu_squared,
 			),
 			mlp=MLP.override(
-				act_fn=leaky_relu_squared
+				act_fn=leaky_relu_squared,
 			),
 		)
 	)

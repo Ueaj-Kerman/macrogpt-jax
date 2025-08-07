@@ -80,8 +80,7 @@ class SoftmaxAttention(nnx.Module, ABC):
 		# LeCun init: stddev = sqrt(1/fan_in) where fan_in = model_d
 		self.k = k(
 			"bnd,dhk->bnhk",
-			nnx.initializers.lecun_normal(),
-			size_dict,
+			size_dict=size_dict,
 			rngs=rngs,
 			dtype=jnp.bfloat16,
 			mesh=mesh,
@@ -89,8 +88,7 @@ class SoftmaxAttention(nnx.Module, ABC):
 		)
 		self.v = v(
 			"bnd,dhv->bnhv",
-			nnx.initializers.lecun_normal(),
-			size_dict,
+			size_dict=size_dict,
 			rngs=rngs,
 			dtype=jnp.bfloat16,
 			mesh=mesh,
@@ -99,8 +97,7 @@ class SoftmaxAttention(nnx.Module, ABC):
 		# Q projection with group query attention (i dimension)
 		self.q = q(
 			"bnd,dhik->bnhik",
-			nnx.initializers.lecun_normal(),
-			size_dict,
+			size_dict=size_dict,
 			rngs=rngs,
 			dtype=jnp.bfloat16,
 			mesh=mesh,
@@ -118,8 +115,8 @@ class SoftmaxAttention(nnx.Module, ABC):
 		# Output projection with zero initialization and batch dims
 		self.o = o(
 			"bnhiv,hivd->bnd",
-			nnx.initializers.zeros_init(),
-			size_dict,
+			initializer=zeros_init,
+			size_dict=size_dict,
 			rngs=rngs,
 			dtype=jnp.bfloat16,
 			mesh=mesh,
@@ -165,7 +162,7 @@ class SoftmaxAttention(nnx.Module, ABC):
 		k = k.astype(jnp.bfloat16)
 		v = v.astype(jnp.bfloat16)
 		# Cast gradients to handle kvax returning fp32 gradients
-		v = gu.noop_fwd_astype_bwd(v, jnp.bfloat16)
+		v = gu.custom_astype(v, jnp.bfloat16, cast_forward=False, cast_backward=True)
 		
 		# Get required parameters from kwargs
 		attention_mask = kwargs.get('attention_mask')
@@ -199,7 +196,7 @@ class SoftmaxAttention(nnx.Module, ABC):
 
 		out = out.reshape(b, n, h, i, self.kq_d).astype(jnp.bfloat16)
 		# Cast output gradients to handle kvax returning fp32 gradients
-		out = gu.noop_fwd_astype_bwd(out, jnp.bfloat16)
+		out = gu.custom_astype(out, jnp.bfloat16, cast_forward=False, cast_backward=True)
 		if self.act_fn is not None:
 			out = self.act_fn(out)
 		y = self.o(out)

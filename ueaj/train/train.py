@@ -40,8 +40,11 @@ model = configs.UEAJ_150M(rngs=rng.Rngs(0))
 graph_def, state = nnx.split(model, nnx.Param)
 
 print(f"Initializing optimizer {optimizer_setup.get_optimizer_name()}...")
-opt_arg_0 = {'lr': jnp.array(0.03125), 'warmup': jnp.array(1.)}
-state = jax.tree.map(lambda x: x.astype(jnp.float32), state)
+base_lr = float(os.environ.get("BASE_LR", 0.025))
+print(f"Using base learning rate: {base_lr}")
+opt_arg_0 = {'lr': jnp.array(base_lr), 'warmup': jnp.array(1.)}
+# Convert params to fp32 for optimizer (master weights)
+state = jax.tree.map(lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x, state)
 
 opt_state = optimizer_setup.make_optimizer(**opt_arg_0, model=model).init(state)
 
@@ -88,8 +91,9 @@ print("Fetching test set...")
 test_tokens, test_doc_ids = next(dataset)
 dataset.send(None)
 
-warmup_tokens 		=    10_000_000
-max_train_tokens	= 1_000_000_000
+warmup_tokens 		=   	10_000_000
+cooldown_tokens 	=	   100_000_000
+max_train_tokens	=	10_000_000_000
 
 print("Starting training...")
 model_path = os.environ.get("MODEL_PATH")
@@ -106,7 +110,8 @@ for i, batch in enumerate(dataset):
 	# Run training
 	train_fn = train_step_stats if i % 10 == 0 else train_step_fast
 	warmup = min(trained_tokens / warmup_tokens, 1.)
-	opt_arg = {**opt_arg_0, 'warmup': warmup}
+
+	opt_arg = {'lr': jnp.array(base_lr * warmup), 'warmup': warmup}
 	tokens, doc_ids = batch
 
 	state, opt_state, stats = train_fn(

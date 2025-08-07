@@ -22,7 +22,6 @@ def make_optimizer(lr: float, warmup: float, model: nnx.Module) -> optax.Gradien
     Returns:
         Configured optimizer
     """
-    lr *= warmup
 
     opt = OptimizerConfig(model)
     
@@ -38,9 +37,9 @@ def make_optimizer(lr: float, warmup: float, model: nnx.Module) -> optax.Gradien
     # Select optimizer with env_var
     opt_name = os.environ.get('OPTIMIZER', 'multiscale')
     if opt_name == 'multiscale':
-        tensor = ms.einsum_aware(ms.multiscale_muon(lr=lr / 8, wd=1e-3, warmup_frac=warmup**2), model)
+        tensor = ms.multiscale_muon(lr=0.833333333 * lr / 8, wd=1e-3, warmup_frac=warmup**2)
     elif opt_name == 'muon':
-        tensor = ms.einsum_aware(ms.muon(lr=lr / 8, wd=1e-3), model)
+        tensor = ms.muon(lr=lr / 8, wd=1e-3)
     elif opt_name == 'adamw':
         tensor = optax.adamw(learning_rate=0.5 * lr, b1=.95, b2=0.999, weight_decay=1e-3)
     else:

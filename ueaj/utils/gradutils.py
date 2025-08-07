@@ -12,7 +12,6 @@ def _normalize_dtype(dtype: Any):
 	"""Convert various dtype formats to a JAX-compatible dtype"""
 	return dtypes.canonicalize_dtype(dtype)
 
-
 def custom_astype(x: jax.Array, dtype: Any, cast_forward: bool = True, cast_backward: bool = True) -> jax.Array:
 	"""
 	Custom astype with control over forward and backward pass casting.
@@ -25,13 +24,6 @@ def custom_astype(x: jax.Array, dtype: Any, cast_forward: bool = True, cast_back
 
 	Returns:
 		Array potentially casted to dtype based on flags
-
-	Examples:
-		# Old astype_fwd_noop_bwd:
-		custom_astype(x, dtype, cast_forward=True, cast_backward=False)
-		
-		# Old noop_fwd_astype_bwd:
-		custom_astype(x, dtype, cast_forward=False, cast_backward=True)
 	"""
 	# Convert dtype outside the custom_vjp to avoid argument issues
 	jax_dtype = _normalize_dtype(dtype)
@@ -62,15 +54,43 @@ def custom_astype(x: jax.Array, dtype: Any, cast_forward: bool = True, cast_back
 	return _custom_astype(x)
 
 
-# Compatibility aliases
-def astype_fwd_noop_bwd(x: jax.Array, dtype: Any) -> jax.Array:
-	"""Legacy function - use custom_astype(x, dtype, cast_forward=True, cast_backward=False) instead."""
-	return custom_astype(x, dtype, cast_forward=True, cast_backward=False)
+def custom_scale(x: jax.Array, scale: float, scale_forward: bool = True, scale_backward: bool = True) -> jax.Array:
+	"""
+	Custom scaling with control over forward and backward pass.
 
+	Args:
+		x: Input array
+		scale: Scaling factor to apply
+		scale_forward: If True, scale in forward pass
+		scale_backward: If True, scale gradients in backward pass
 
-def noop_fwd_astype_bwd(x: jax.Array, dtype: Any) -> jax.Array:
-	"""Legacy function - use custom_astype(x, dtype, cast_forward=False, cast_backward=True) instead."""
-	return custom_astype(x, dtype, cast_forward=False, cast_backward=True)
+	Returns:
+		Array potentially scaled based on flags
+	"""
+	@jax.custom_vjp
+	def _custom_scale(x_inner):
+		if scale_forward:
+			return x_inner * scale
+		else:
+			return x_inner
+
+	def _fwd(x_inner):
+		# Forward: conditionally scale based on scale_forward
+		if scale_forward:
+			y = x_inner * scale
+		else:
+			y = x_inner
+		return y, None
+
+	def _bwd(_, g):
+		# Backward: conditionally scale gradient based on scale_backward
+		if scale_backward:
+			return (g * scale,)
+		else:
+			return (g,)
+
+	_custom_scale.defvjp(_fwd, _bwd)
+	return _custom_scale(x)
 
 
 def identity_grad(x: jax.Array, lambda_: float | jax.Array = .1):
@@ -99,13 +119,6 @@ def debug_tensor(x: jax.Array, name: str = "tensor", show_values: bool = False) 
 
 	Returns:
 		Input array unchanged (identity function with debug prints)
-
-	Examples:
-		# Old debug_dtype:
-		debug_tensor(x, name="my_tensor", show_values=False)
-		
-		# Old debug_grad_flow:
-		debug_tensor(x, name="my_tensor", show_values=True)
 	"""
 
 	@jax.custom_vjp
@@ -128,64 +141,6 @@ def debug_tensor(x: jax.Array, name: str = "tensor", show_values: bool = False) 
 
 	_debug_tensor.defvjp(_fwd, _bwd)
 	return _debug_tensor(x)
-
-
-# Compatibility aliases
-def debug_dtype(x: jax.Array, name: str = "tensor") -> jax.Array:
-	"""Legacy function - use debug_tensor(x, name, show_values=False) instead."""
-	return debug_tensor(x, name, show_values=False)
-
-
-def debug_grad_flow(x: jax.Array, name: str = "tensor") -> jax.Array:
-	"""Legacy function - use debug_tensor(x, name, show_values=True) instead."""
-	return debug_tensor(x, name, show_values=True)
-
-
-def te_gradient_workaround(x: jax.Array) -> jax.Array:
-	"""
-	Workaround for TransformerEngine CUDA illegal memory access error.
-
-	This error occurs when normalized tensors are passed to TE's fused attention
-	during JIT compilation. The custom VJP breaks the problematic gradient pattern
-	while preserving correct gradients.
-	"""
-
-	@jax.custom_vjp
-	def _identity_with_grad(x):
-		return x
-
-	def _fwd(x):
-		return x, x.sum()
-
-	def _bwd(_, g):
-		# Pass gradient through normally
-		return (g,)
-
-	_identity_with_grad.defvjp(_fwd, _bwd)
-	return _identity_with_grad(x)
-
-
-_PLACEHOLDER = FrozenDict({FrozenDict(): FrozenDict()})
-
-class Checkpoint(nnx.Variable):
-	pass
-
-class WrappedVJP(nnx.Module):
-	def __init__(self, vjp_fn: Callable, wrapper: Callable):
-		super().__init__()
-		state, fn_def = jax.tree.flatten(vjp_fn)
-
-		self.state = {i: Checkpoint(s) for i, s in enumerate(state)}
-		self.fn_def = fn_def
-		self.wrapper = wrapper
-
-	def __call__(self, *args):
-		state = (self.state[i] for i in range(len(self.state)))
-		vjp_fn = jax.tree.unflatten(self.fn_def, state)
-		if self.wrapper is None:
-			return vjp_fn(*args)
-		else:
-			return self.wrapper(vjp_fn(*args))
 
 def nnx_vjp(fun, *args, has_aux=False, wrt=nnx.Param, **kwargs):
 	"""
@@ -251,11 +206,6 @@ def nnx_vjp(fun, *args, has_aux=False, wrt=nnx.Param, **kwargs):
 		return vjp_out[0], vjp_fn, vjp_out[2]
 	else:
 		return vjp_out[0], vjp_fn
-
-@functools.partial(jax.jit, static_argnums=(0,))
-def run_vjp(fn_def, state):
-	fn = jax.tree.unflatten(fn_def, state)
-	return fn(jnp.ones((3, 20)))
 
 def custom_grad_vectors(vec1: jax.Array, vec2: jax.Array, var_lr: float = 1.0) -> jax.Array:
 	"""

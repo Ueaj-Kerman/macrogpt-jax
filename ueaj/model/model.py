@@ -32,6 +32,7 @@ class LlamaModel(nnx.Module):
 		transformer_layer: Callable = TransformerLayer,
 		norm: Callable = RMSNorm,
 		embed: Callable = nnx.Embed,
+		lm_head: Callable = Einsum,
 		head_cap: str = 'tanh',
 		*,
 		rngs: rng.Rngs,
@@ -82,10 +83,9 @@ class LlamaModel(nnx.Module):
 
 		# Output projection (lm_head) - only if not tied
 		if not tie_word_embeddings:
-			# Use Einsum for lm_head
-			self.lm_head = Einsum(
+			# Use lm_head callable for output projection
+			self.lm_head = lm_head(
 				"bnd,dv->bnv",
-				nnx.initializers.zeros_init(),
 				size_dict={'d': model_d, 'v': vocab_size},
 				rngs=rngs,
 				dtype=jnp.bfloat16,
@@ -119,7 +119,9 @@ class LlamaModel(nnx.Module):
 		@nnx.scan
 		@nnx.remat(policy=jax.checkpoint_policies.nothing_saveable)
 		def scan(act, layer):
-			return layer(act, mesh=mesh, **kwargs), None
+			# Ensure output dtype matches input dtype
+			out = layer(act, mesh=mesh, **kwargs)
+			return out.astype(act.dtype), None
 
 		if mesh is not None:
 			act0 = jax.lax.with_sharding_constraint(act0, jax.NamedSharding(mesh, TENSOR_SHARDING))

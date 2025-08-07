@@ -262,7 +262,7 @@ def compile_training_functions(
             'document_ids': document_ids_struct,
             'pad_token_id': pad_token,
             'stats_to_collect': (
-                'mean_loss', 'std_loss', 'grad_norm', 'update_norm', 'param_l1_norm'
+                'mean_loss', 'std_loss', 'grad_norm', 'update_norm', 'param_l2_norm'
             ),
         },
         name="Train Step (Stats)"

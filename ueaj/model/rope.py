@@ -101,7 +101,7 @@ class RoPE(nnx.Module):
 
 		rope = jnp.concatenate([out1, out2], axis=-1)
 		# Cast gradients to input dtype to handle kvax returning fp32 gradients
-		rope = gu.noop_fwd_astype_bwd(rope, x.dtype)
+		rope = gu.custom_astype(rope, x.dtype, cast_forward=False, cast_backward=True)
 		return rope
 
 if __name__ == "__main__":
