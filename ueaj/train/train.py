@@ -108,7 +108,7 @@ for i, batch in enumerate(dataset):
 	start_train = time.time()
 
 	# Run training
-	train_fn = train_step_stats if i % 10 == 0 else train_step_fast
+	train_fn = train_step_stats if i % 25 == 0 else train_step_fast
 	warmup = min(trained_tokens / warmup_tokens, 1.)
 
 	opt_arg = {'lr': jnp.array(base_lr * warmup), 'warmup': warmup}
@@ -155,7 +155,7 @@ for i, batch in enumerate(dataset):
 	trained_tokens = log_values['trained_tokens']
 
 	# Print basic info always
-	print(f"[{i}] Train loss: {log_values['mean_loss']:.2f}, Std loss: {log_values['std_loss']:.2f}, Tokens/s: {log_values['tokens_per_second']:.0f}, Tokens: {trained_tokens}")
+	print(f"[{i}] Train loss: {log_values['mean_loss']:.2f}, Std loss: {log_values['std_loss']:.2f}, Tokens/s: {log_values['tokens_per_second']:.0f}, Tokens: {trained_tokens}, Train time: {train_time:.2f}s")
 
 	if np.isnan(log_values['mean_loss']):
 		print("Loss is NaN, stopping training...")
