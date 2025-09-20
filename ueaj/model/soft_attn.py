@@ -1,3 +1,4 @@
+import functools
 from abc import ABC
 from typing import *
 
@@ -19,43 +20,43 @@ from ueaj.utils.configurator import *
 @config
 class SoftmaxAttention(nnx.Module, ABC):
 	"""Multi-head attention with minimal configuration.
-	
+
 	Only necessary parameters:
 	- model_d: Model dimension
 	- kq_d: Key/query dimension per head
 	- kv_heads: Number of key/value heads
 	- rngs: Random number generators
-	
+
 	Optional features:
 	- kv_q_ratio: Ratio of query heads to kv heads (for grouped query attention)
 	- rope_theta: RoPE theta for positional encoding
 	- window_size: Sliding window attention
 	- act_fn: Activation function after attention
 	"""
-	
-	def __init__(self, 
-		model_d: int,
-		kq_d: int = 64,  # Good default head dimension
-		kv_heads: int | None = None,  # Will default to model_d // kq_d
-		kv_q_ratio: int = 1,
-		rope_theta: float | None = 10000.0,
-		window_size: int | None = None,
-		act_fn: Callable[[jax.Array], jax.Array] | None = None,
-		k: Callable = Einsum,
-		v: Callable = Einsum,
-		q: Callable = Einsum,
-		o: Callable = Einsum,
-		attn_scale: float | Literal['mup', 'sp'] = 'sp',
-		*,
-		rngs: rng.Rngs,
-		mesh: Optional[jax.sharding.Mesh] = None
-	):
+
+	def __init__(self,
+				 model_d: int,
+				 kq_d: int = 64,  # Good default head dimension
+				 kv_heads: int | None = None,  # Will default to model_d // kq_d
+				 kv_q_ratio: int = 1,
+				 rope_theta: float | None = 10000.0,
+				 window_size: int | None = None,
+				 act_fn: Callable[[jax.Array], jax.Array] | None = None,
+				 k: Callable = Einsum,
+				 v: Callable = Einsum,
+				 q: Callable = Einsum,
+				 o: Callable = Einsum,
+				 attn_scale: float | Literal['mup', 'sp'] = 'sp',
+				 *,
+				 rngs: rng.Rngs,
+				 mesh: Optional[jax.sharding.Mesh] = None
+				 ):
 		super().__init__()
-		
+
 		# Default kv_heads if not specified
 		if kv_heads is None:
 			kv_heads = model_d // kq_d
-		
+
 		# Store necessary config
 		self.model_d = model_d
 		self.kq_d = kq_d
@@ -104,8 +105,7 @@ class SoftmaxAttention(nnx.Module, ABC):
 			sharding=(None, 'tensor', None, None)
 		)
 
-
-		if mesh and size_dict['i']*size_dict['v']*(size_dict['h'] // mesh.shape['tensor']) > size_dict['d']:
+		if mesh and size_dict['i'] * size_dict['v'] * (size_dict['h'] // mesh.shape['tensor']) > size_dict['d']:
 			# down project first to save memory then ring reduce
 			down_shards = ('tensor', None, None, None)
 		else:
@@ -131,12 +131,11 @@ class SoftmaxAttention(nnx.Module, ABC):
 		else:
 			self.rope = None
 
-
 	@property
 	def config(self):
 		"""For backwards compatibility with code that accesses self.config"""
 		return self
-	
+
 	def window_tuple(self) -> tuple[int, int] | None:
 		return (0, self.window_size) if self.window_size else None
 
@@ -158,22 +157,23 @@ class SoftmaxAttention(nnx.Module, ABC):
 
 		# Reshape tensors for attention
 		b, n, h, i, k_dim = q.shape
-		q_reshaped = q.reshape(b, n, h * i, k_dim).astype(jnp.bfloat16)
-		k = k.astype(jnp.bfloat16)
-		v = v.astype(jnp.bfloat16)
-		# Cast gradients to handle kvax returning fp32 gradients
-		v = gu.custom_astype(v, jnp.bfloat16, cast_forward=False, cast_backward=True)
-		
+		q_reshaped = q.reshape(b, n, h * i, k_dim)
+
+		explicit_recast = functools.partial(gu.custom_astype, dtype=jnp.bfloat16, cast_forward=True, cast_backward=True)
+		q_reshaped = explicit_recast(q_reshaped)
+		k = explicit_recast(k)
+		v = explicit_recast(v)
+
 		# Get required parameters from kwargs
 		attention_mask = kwargs.get('attention_mask')
 		if attention_mask is None:
 			raise ValueError("attention_mask must be provided in kwargs")
-			
+
 		query_positions = kwargs.get('query_positions', position_ids)
 		kv_positions = kwargs.get('kv_positions', position_ids)
 		query_segment_ids = kwargs.get('query_segment_ids', jnp.zeros((b, n), dtype=jnp.int32))
 		kv_segment_ids = kwargs.get('kv_segment_ids', query_segment_ids)
-		
+
 		# Apply flash attention with proper scaling
 		if self.attn_scale == 'mup':
 			scale = np.float32(1.0 / self.kq_d)
@@ -195,12 +195,11 @@ class SoftmaxAttention(nnx.Module, ABC):
 		)
 
 		out = out.reshape(b, n, h, i, self.kq_d).astype(jnp.bfloat16)
-		# Cast output gradients to handle kvax returning fp32 gradients
-		out = gu.custom_astype(out, jnp.bfloat16, cast_forward=False, cast_backward=True)
 		if self.act_fn is not None:
 			out = self.act_fn(out)
 		y = self.o(out)
 		return y
+
 
 if __name__ == "__main__":
 	# attn = nnx.eval_shape(lambda: SoftmaxAttention(

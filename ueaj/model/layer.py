@@ -47,7 +47,6 @@ class TransformerLayer(nnx.Module):
 			Output tensor of same shape as input
 		"""
 		# Attention block with residual connection
-		# Use TransformerEngine workaround for attention normalization
 		x += self.attn(self.attn_norm(x), **kwargs)
 		x += self.mlp(self.mlp_norm(x))
 		if mesh is not None:

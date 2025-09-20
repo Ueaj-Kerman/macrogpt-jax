@@ -52,13 +52,21 @@ def test(
     # Note: The model.get_activations already handles kvax context internally
     activations = model.get_activations(inputs, **kwargs)
 
+    def logit_projection(hidden_states: jax.Array, g_def, params, etc) -> jax.Array:
+        """Reconstruct a fresh module to keep RNG state from drifting under remat."""
+        model = nnx.merge(g_def, params, etc)
+        return model.get_logits(hidden_states)
+
     token_loss, loss_mask = chunked_softmax_cross_entropy(
         inputs,
         activations,
-        model.get_logits,
+        logit_projection,
         document_ids=document_ids,
         pad_token_id=pad_token_id,
-        return_loss_mask=True
+        return_loss_mask=True,
+		g_def=g_def,
+		params=params,
+		etc=etc,
     )
     count = loss_mask.sum(dtype=jnp.float32)
 

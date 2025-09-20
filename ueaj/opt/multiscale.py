@@ -8,6 +8,8 @@ from jax import numpy as jnp
 import jax
 from flax import nnx
 
+from ueaj.opt.canonicalize import *
+
 
 def clip_outliers(z: float | int = 2):
 	def update_fn(updates, params=None):
@@ -37,11 +39,11 @@ def leading_multiply(array, target):
 
 
 def multiscale_momentum(
-	mom_coeffs: Sequence[float],
-	accumulate: float | Sequence[float] | None = None,
-	preconditioner: Callable[[jax.Array], jax.Array] = lambda x: jnp.sign(x),
-	dtype=jnp.float32,
-	cooldown_frac: float = 0.
+		mom_coeffs: Sequence[float],
+		accumulate: float | Sequence[float] | None = None,
+		preconditioner: Callable[[jax.Array], jax.Array] = lambda x: jnp.sign(x),
+		dtype=jnp.float32,
+		cooldown_frac: float = 0.
 ) -> GradientTransformation:
 	mom_coeffs = jnp.array(mom_coeffs)
 
@@ -106,13 +108,14 @@ def scale_by_muonP(base_lr: float):
 # -3 (base)
 # -4
 def multiscale_muon(
-	lr=.125,
-	warmup_frac=1.,
-	wd: Optional[float] = None,
-	method: Literal['muon', 'optimal'] = 'muon',
-	dtype=jnp.float32
+		model: nnx.Module,
+		lr=.125,
+		warmup_frac=1.,
+		wd: Optional[float] = None,
+		method: Literal['muon', 'optimal'] = 'muon',
+		dtype=jnp.float32
 ):
-	return optax.chain(
+	base = optax.chain(
 		clip_outliers(2),
 		multiscale_momentum(
 			[0.96875, 0.9921875, 0.998046875],
@@ -122,29 +125,32 @@ def multiscale_muon(
 		),
 		optax.add_decayed_weights(wd) if wd else optax.identity(),
 		scale_by_muonP(lr),
-		cast_to(None)
+		cast_to(None),
 	)
+	return canonicalize_einsums(model, base)
 
 
-def muon(lr=.125, wd: Optional[float] = None, beta=.95875, method: Literal['muon', 'optimal'] = 'muon'):
-	return optax.chain(
+def muon(model: nnx.Module, lr=.125, wd: Optional[float] = None, beta=.95875,
+		 method: Literal['muon', 'optimal'] = 'muon'):
+	base = optax.chain(
 		clip_outliers(2),
 		multiscale_momentum(
-			[0.96875],
+			[beta],
 			preconditioner=functools.partial(orthogonalize, method=method)
 		),
 		optax.add_decayed_weights(wd) if wd else optax.identity(),
 		scale_by_muonP(lr),
-		cast_to(None)
+		cast_to(None),
 	)
+	return canonicalize_einsums(model, base)
 
 
 def orthogonalize(
-	x,
-	ns_steps=5,
-	eps=1e-8,
-	method: Literal['muon', 'optimal'] = 'muon',
-	convergence_speed: Optional[float] = 1e-3
+		x,
+		ns_steps=5,
+		eps=1e-8,
+		method: Literal['muon', 'optimal'] = 'muon',
+		convergence_speed: Optional[float] = 1e-3
 ):
 	if method == 'muon':
 		coeffs = (3.4445, -4.7750, 2.0315)

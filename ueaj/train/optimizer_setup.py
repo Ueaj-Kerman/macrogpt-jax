@@ -35,11 +35,11 @@ def make_optimizer(lr: float, warmup: float, model: nnx.Module) -> optax.Gradien
     embed = optax.adam(learning_rate=lr, b1=.95, b2=.999)
 
     # Select optimizer with env_var
-    opt_name = os.environ.get('OPTIMIZER', 'adamw')
+    opt_name = get_optimizer_name()
     if opt_name == 'multiscale':
-        tensor = ms.multiscale_muon(lr=0.833333333 * lr / 8, wd=1e-3, warmup_frac=warmup**2)
+        tensor = ms.multiscale_muon(model, lr=0.833333333 * lr / 8, wd=1e-3, warmup_frac=warmup**2)
     elif opt_name == 'muon':
-        tensor = ms.muon(lr=lr / 8, wd=1e-3)
+        tensor = ms.muon(model, lr=lr / 8, wd=1e-2)
     elif opt_name == 'adamw':
         tensor = optax.adamw(learning_rate=.03125 * lr, b1=.95, b2=0.999, weight_decay=1e-3)
     else:
@@ -57,4 +57,4 @@ def make_optimizer(lr: float, warmup: float, model: nnx.Module) -> optax.Gradien
 
 def get_optimizer_name() -> str:
     """Get optimizer name from environment variable."""
-    return os.environ.get('OPTIMIZER', 'multiscale')
+    return os.environ.get('OPTIMIZER', 'muon')

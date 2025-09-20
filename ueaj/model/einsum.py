@@ -70,6 +70,12 @@ class EinsumMetadata:
 	canonical_shape: Tuple[int, ...]
 	reduced_shape: Tuple[int, ...]
 	transpose_axes: List[int]
+	batch_ndim: int
+	reducing_ndim: int
+	non_reducing_ndim: int
+	batch_shape: Tuple[int, ...]
+	reducing_shape: Tuple[int, ...]
+	non_reducing_shape: Tuple[int, ...]
 
 
 def parse_einsum_expr(expr: str) -> Tuple[str, str, str]:
@@ -131,7 +137,13 @@ def compute_weight_metadata(
 	return EinsumMetadata(
 		canonical_shape=canonical_shape,
 		reduced_shape=reduced_shape,
-		transpose_axes=transpose_axes
+		transpose_axes=transpose_axes,
+		batch_ndim=len(batch_dims_tuple),
+		reducing_ndim=len(reducing_dims_tuple),
+		non_reducing_ndim=len(non_reducing_dims_tuple),
+		batch_shape=batch_shape,
+		reducing_shape=reducing_shape,
+		non_reducing_shape=non_reducing_shape
 	)
 
 

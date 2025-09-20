@@ -1,4 +1,4 @@
-jax[cuda12_local]~=0.7.0
+jax[cuda12_local]>=0.7.0
 flax~=0.10.6
 datasets~=3.6.0
 huggingface_hub~=0.33.0

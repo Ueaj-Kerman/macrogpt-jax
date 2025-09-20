@@ -87,6 +87,7 @@ class LlamaModel(nnx.Module):
 			self.lm_head = lm_head(
 				"bnd,dv->bnv",
 				size_dict={'d': model_d, 'v': vocab_size},
+				initializer=zeros_init,
 				rngs=rngs,
 				dtype=jnp.bfloat16,
 				mesh=mesh,

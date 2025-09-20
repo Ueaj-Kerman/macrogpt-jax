@@ -14,6 +14,27 @@ def device_prefetch(
 ) -> Generator[Any, None, None]:
 	"""Create an async GPU iterator that prefetches and copies numpy arrays to GPU.
 
+	This generator prefetches data asynchronously to overlap data loading with computation.
+	It uses JAX's async transfer capabilities to schedule GPU copies without blocking.
+
+	Usage Pattern:
+		# Create the prefetch iterator
+		dataset = device_prefetch(data_iterator, buffer_size=5)
+		
+		# Training loop
+		for batch in dataset:
+			# Process batch (computation overlaps with next batch loading)
+			result = model(batch)
+			
+			# Signal the generator to load next entry during async dispatch
+			dataset.send(None)
+			
+			# Wait for computation to complete
+			result.block_until_ready()
+
+	The key is calling dataset.send(None) after each batch to signal the generator
+	to schedule the next async copy while the current batch is being processed.
+
 	Args:
 		iterator: Parent iterator to fetch from
 		buffer_size: Number of items to prefetch (default 1)

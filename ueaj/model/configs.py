@@ -44,7 +44,6 @@ def format_param_count(count: int) -> str:
 		return str(count)
 
 
-
 # UEAJ configuration
 def ueaj_model(vocab_size: int, model_d: int, num_layers: int, kq_ratio: int = 1):
 	"""Create UEAJ model configuration using override pattern."""

@@ -1,11 +1,12 @@
 """
 Next token prediction loss for language models with chunked computation.
 """
-
+import functools
 from typing import Optional, Tuple, Callable
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from optax import softmax_cross_entropy_with_integer_labels
 import ueaj.utils as us
 
@@ -97,12 +98,13 @@ def ntp_args(
 def chunked_softmax_cross_entropy(
 	inputs: jax.Array,
 	activations: jax.Array,
-	logit_projection: Callable[[jax.Array], jax.Array],
+	logit_projection: Callable[[jax.Array, ...], jax.Array],
 	chunk_size: int = 1024,
 	document_ids: Optional[jax.Array] = None,
 	pad_token_id: Optional[int] = None,
 	loss_mask: Optional[jax.Array] = None,
-	return_loss_mask: bool = False
+	return_loss_mask: bool = False,
+	**logit_proj_kwargs
 ) -> jax.Array | Tuple[jax.Array, jax.Array]:
 	"""Compute cross-entropy loss for language modeling with chunked processing.
 	
@@ -160,11 +162,11 @@ def chunked_softmax_cross_entropy(
 
 	def loss_fn(_, x):
 		activations, targets, mask = x
-		logits = logit_projection(activations)
+		logits = logit_projection(activations, **logit_proj_kwargs)
 		loss = softmax_cross_entropy_with_integer_labels(logits, targets)
 		return None, loss * mask.astype(loss.dtype)
 
-	_, output = us.chunked_scan(loss_fn, None, (activations, targets, mask), chunk_size=chunk_size, axis=1, out_axis=1)
+	_, output = us.chunked_scan(loss_fn, None, (activations, targets, mask), chunk_size=chunk_size, axis=1, out_axis=1, use_checkpointing=True)
 	if return_loss_mask:
 		return output, mask
 	return output

@@ -16,6 +16,7 @@ def chunked_scan(
 	chunk_size: int,
 	axis: Union[int, Tuple[int, ...], dict, None] = 0,
 	out_axis: Union[int, Tuple[int, ...], dict, None] = 0,
+	use_checkpointing=False,
 ) -> Tuple[Any, Any]:
 	def transpose(x, ax, fwd=True):
 		if isinstance(ax, int):
@@ -46,11 +47,22 @@ def chunked_scan(
 		xs_t
 	)
 
-	carry, ys = jax.lax.scan(
-		lambda carry, x: f(carry, transpose(x, axis, fwd=False)),
-		init,
-		xs_scan,
-	)
+	def invoke(carry, x):
+		return f(carry, transpose(x, axis, fwd=False))
+
+	if use_checkpointing:
+		carry, ys = jax.lax.scan(
+			jax.remat(invoke, policy=jax.checkpoint_policies.nothing_saveable),
+			init,
+			xs_scan,
+			unroll=2 # for some reason this fixes the loss going up bug, don't ask me why
+		)
+	else:
+		carry, ys = jax.lax.scan(
+			invoke,
+			init,
+			xs_scan,
+		)
 
 	if out_axis != 0:
 		ys = transpose(ys, out_axis, fwd=True)
