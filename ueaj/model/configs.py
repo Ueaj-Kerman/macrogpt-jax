@@ -45,7 +45,7 @@ def format_param_count(count: int) -> str:
 
 
 # UEAJ configuration
-def ueaj_model(vocab_size: int, model_d: int, num_layers: int, kq_ratio: int = 1):
+def ueaj_model(vocab_size: int, model_d: int, num_layers: int, kq_ratio: int = 1, kq_d=64):
 	"""Create UEAJ model configuration using override pattern."""
 	from ueaj.model import SoftmaxAttention
 	from ueaj.model import MLP
@@ -59,14 +59,14 @@ def ueaj_model(vocab_size: int, model_d: int, num_layers: int, kq_ratio: int = 1
 		num_layers=num_layers,
 		transformer_layer=TransformerLayer.override(
 			attn=SoftmaxAttention.override(
-				kq_d=64,
-				kv_heads=model_d // 128,
+				kq_d=kq_d,
+				kv_heads=model_d // (kq_d*2),
 				kv_q_ratio=kq_ratio,
 				rope_theta=2_000.0,
-				act_fn=leaky_relu_squared,
+				act_fn=relu_squared,
 			),
 			mlp=MLP.override(
-				act_fn=leaky_relu_squared,
+				act_fn=relu_squared,
 			),
 		)
 	)
@@ -76,7 +76,9 @@ def ueaj_model(vocab_size: int, model_d: int, num_layers: int, kq_ratio: int = 1
 UEAJ_NH = ueaj_model(50432, 768, 1)
 UEAJ_150M = ueaj_model(50432, 768, 12)
 UEAJ_1B = ueaj_model(50432, 1536, 32, kq_ratio=2)
+UEAJ_3B = ueaj_model(50432, 2048, 48, kq_ratio=4, kq_d=256)
 
 if __name__ == "__main__":
 	print(f"UEAJ-150M has {format_param_count(count_parameters(UEAJ_150M))} parameters")
 	print(f"UEAJ-1B has {format_param_count(count_parameters(UEAJ_1B))} parameters")
+	print(f"UEAJ-3B has {format_param_count(count_parameters(UEAJ_3B))} parameters")

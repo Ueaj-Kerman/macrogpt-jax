@@ -1,6 +1,7 @@
 """
 Llama model implementation for loading and running Llama models from HuggingFace.
 """
+import jax
 
 from ueaj.model.layer import *
 from ueaj.model.rmsnorm import *
@@ -111,7 +112,7 @@ class LlamaModel(nnx.Module):
 			:param mesh:
 		"""
 		# Embed tokens
-		act0 = self.embed_tokens(input_ids)
+		act0: jax.Array = self.embed_tokens(input_ids)
 
 		kwargs = self.default_kwargs(*input_ids.shape, **kwargs)
 

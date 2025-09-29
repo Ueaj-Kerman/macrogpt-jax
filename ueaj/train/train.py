@@ -2,7 +2,7 @@ import os
 
 os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
 os.environ["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"] = "1"  # Required for kvax
-
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=".95"
 import wandb
 import gc
 import time
@@ -46,15 +46,19 @@ opt_arg_0 = {'lr': jnp.array(base_lr), 'warmup': jnp.array(1.)}
 # Convert params to fp32 for optimizer (master weights)
 state = jax.tree.map(lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x, state)
 
-opt_state = optimizer_setup.make_optimizer(**opt_arg_0, model=model).init(state)
+opt_dtype=jnp.float32
+
+gc.collect()
+opt_state = optimizer_setup.make_optimizer(**opt_arg_0, model=model, dtype=opt_dtype).init(state)
 
 print(jax.tree.map(lambda x: (x.shape, x.dtype), opt_state))
 
 # Compile all training functions
+gc.collect()
 test_compiled, train_step_fast, train_step_stats = training_utils.compile_training_functions(
 	graph_def=graph_def,
 	state=state,
-	make_optimizer=optimizer_setup.make_optimizer,
+	make_optimizer=optimizer_setup.make_optimizer.override(dtype=opt_dtype),
 	opt_arg_0=opt_arg_0,
 	opt_state=opt_state,
 	tokens_struct=tokens_struct,

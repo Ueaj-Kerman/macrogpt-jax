@@ -1,23 +1,10 @@
 import functools
 from functools import lru_cache
-from typing import Sequence, Callable, Literal, Optional, Any
+from typing import Sequence, Callable, Literal, Optional
 
-import optax
-from optax import GradientTransformation, TransformInitFn, TransformUpdateFn
-from jax import numpy as jnp
-import jax
-from flax import nnx
+from optax import GradientTransformation
 
 from ueaj.opt.canonicalize import *
-
-
-def clip_outliers(z: float | int = 2):
-	def update_fn(updates, params=None):
-		sigma = jax.tree.map(lambda u: jnp.sqrt(jnp.mean(jnp.square(u), dtype=jnp.float32)).astype(u.dtype), updates)
-		updates = jax.tree.map(lambda u, sigma: jnp.clip(u, -z * sigma, z * sigma), updates, sigma)
-		return updates
-
-	return optax.stateless(update_fn)
 
 
 def cast_to(dtype: jnp.dtype | None) -> GradientTransformation:
@@ -29,14 +16,11 @@ def cast_to(dtype: jnp.dtype | None) -> GradientTransformation:
 		)
 	)
 
-
 def lerp(a, b, alpha):
 	return a + alpha * (b - a)
 
-
 def leading_multiply(array, target):
 	return array.reshape((-1,) + (1,) * (len(target.shape) - 1)) * target
-
 
 def multiscale_momentum(
 		mom_coeffs: Sequence[float],
@@ -52,11 +36,18 @@ def multiscale_momentum(
 	else:
 		accumulate = jnp.array(accumulate)
 
-	base_scales = ((1 - mom_coeffs) / (1 - jnp.min(mom_coeffs)))
-	base_scales = base_scales / jnp.sqrt(base_scales.sum() + 1e-6)
+	# base_scales = ((1 - mom_coeffs) / (1 - jnp.min(mom_coeffs)))
+	# base_scales = base_scales / jnp.sqrt(base_scales.sum() + 1e-6)
 
-	cooldown = (1 - jnp.max(mom_coeffs)) / (1 - mom_coeffs)
-	scales = jnp.where(cooldown_frac > cooldown, 0, base_scales)
+	# cooldown = (1 - jnp.max(mom_coeffs)) / (1 - mom_coeffs)
+	# scales = jnp.where(cooldown_frac > cooldown, 0, base_scales)
+
+	eff_bn1 = jnp.log2(mom_coeffs) / jnp.log2(.5)
+
+	frac = eff_bn1 / jnp.max(eff_bn1)
+	base_scales = frac / jnp.sqrt(frac.sum() + 1e-6)
+
+	scales = jnp.where(cooldown_frac > frac, 0, base_scales)
 
 	def init_fn(params):
 		return jax.tree.map(lambda x: jnp.zeros((len(mom_coeffs),) + x.shape, dtype=dtype), params)
@@ -116,7 +107,6 @@ def multiscale_muon(
 		dtype=jnp.float32
 ):
 	base = optax.chain(
-		clip_outliers(2),
 		multiscale_momentum(
 			[0.96875, 0.9921875, 0.998046875],
 			preconditioner=functools.partial(orthogonalize, method=method),
@@ -131,12 +121,12 @@ def multiscale_muon(
 
 
 def muon(model: nnx.Module, lr=.125, wd: Optional[float] = None, beta=.95875,
-		 method: Literal['muon', 'optimal'] = 'muon'):
+		 method: Literal['muon', 'optimal'] = 'muon', dtype=jnp.float32):
 	base = optax.chain(
-		clip_outliers(2),
 		multiscale_momentum(
 			[beta],
-			preconditioner=functools.partial(orthogonalize, method=method)
+			preconditioner=functools.partial(orthogonalize, method=method),
+			dtype=dtype
 		),
 		optax.add_decayed_weights(wd) if wd else optax.identity(),
 		scale_by_muonP(lr),

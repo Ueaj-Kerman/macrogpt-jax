@@ -1,6 +1,8 @@
 """Custom activation functions."""
 import jax.numpy as jnp
 
+def relu_squared(x):
+    return jnp.where(x >= 0, jnp.square(x), 0)
 
 def leaky_relu_squared(x):
     """Leaky ReLU squared activation function.

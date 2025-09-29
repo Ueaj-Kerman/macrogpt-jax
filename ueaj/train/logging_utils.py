@@ -57,7 +57,7 @@ def log_training_metrics(
     wandb_dict = {
         "step": step,
         "tokens": trained_tokens,
-        "lr": float(opt_arg['lr']*opt_arg['warmup']),
+        "lr": float(opt_arg['lr']),
         "train_time": train_time,
         "wait_time": wait_time,
         "tokens_per_second": tokens_per_second,
