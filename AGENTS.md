@@ -1,21 +1,38 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-The `ueaj/` package is the core library: `model/` defines configurable LLaMA variants, `train/` contains the training loop, logging, and optimizer setup, `opt/` hosts experimental optimizer kernels, and `utils/` offers configuration and compilation helpers. Dataset streaming and token preparation live in `ueaj/data/`. The `scripts/` directory provides shell helpers for running Python within the preconfigured JAX virtual environment. Tests are collected under `test/`, while `test.py` is a quick smoke example for the `config` helper.
+- `ueaj/model/` — configurable LLaMA variants.
+- `ueaj/train/` — training loop, logging, optimizer setup.
+- `ueaj/opt/` — experimental optimizer kernels.
+- `ueaj/utils/` — configuration and compilation helpers.
+- `ueaj/data/` — dataset streaming and token preparation.
+- `scripts/` — shell helpers for the JAX-managed Python environment.
+- `test/`, `test.py` — regression tests and a config smoke example.
 
 ## Build, Test, and Development Commands
-- `scripts/run_python.sh python -m ueaj.train.train` — launch the distributed pretraining loop with the repository-managed interpreter; set `RUN_NAME` and `MODEL_PATH` to control logging and checkpoints.
-- `scripts/run_python.sh python test.py` — verify that the configuration override system still behaves as expected.
-- `python -m pytest test -q` — execute the unroll and optimizer regression tests; add `-k <pattern>` to focus on a failing scenario (e.g., `-k unroll_real`).
+- `scripts/run_python.sh python -m ueaj.train.train` — launch distributed pretraining; set `RUN_NAME` and `MODEL_PATH` for logging and checkpoints.
+- `scripts/run_python.sh python test.py` — verify configuration override behavior.
+- `python -m pytest test -q` — run unroll and optimizer regression tests; add `-k <pattern>` to focus (e.g., `-k unroll_real`).
 
 ## Coding Style & Naming Conventions
-Code is Python 3.11+, with 4-space indentation and type hints for public APIs (`ueaj/utils/configurator.py`, `ueaj/train/training_utils.py`). Use `snake_case` for functions and modules, `CamelCase` for classes, and `UPPER_SNAKE_CASE` for constants. Prefer composition via the `@config` decorator so overrides remain declarative, and keep module docstrings concise but descriptive.
+- Python 3.11+, tabs only. Use type hints for public APIs (see `ueaj/utils/configurator.py`, `ueaj/train/training_utils.py`).
+- Naming: `snake_case` for functions/modules, `CamelCase` for classes, `UPPER_SNAKE_CASE` for constants.
+- Prefer composition via the `@config` decorator; keep module docstrings concise and descriptive.
 
 ## Testing Guidelines
-Pytest drives regression coverage; keep new tests near related modules inside `test/` and mirror existing filenames (`test_unroll_*`). Aim to exercise both compilation-time and runtime metrics when adding optimizer features, and include asserts plus printed diagnostics only when they help trace regressions. Before opening a PR, run `python -m pytest test -q` and capture any failing seeds.
+- Pytest drives regression coverage; keep new tests near related modules inside `test/` and mirror existing filenames (e.g., `test_unroll_*`).
+- Exercise both compilation-time and runtime metrics when adding optimizer features; include asserts and minimal diagnostics when they help trace regressions.
+- Run locally with `python -m pytest test -q`; capture failing seeds and note them in PRs.
 
 ## Commit & Pull Request Guidelines
-Recent history favors short, imperative summaries (e.g., `prefetch docs`, `distributed`). Group related changes per commit and note major configuration shifts in the body. Pull requests should link the relevant research ticket or issue, outline the experiment intent, and attach key artifacts: pytest results, WANDB run URLs, and, when training behavior changes, a brief loss/throughput comparison. Screenshots are only needed for visualization utilities.
+- Commits: short, imperative summaries (e.g., `prefetch docs`, `distributed`). Group related changes; note major configuration shifts in the body.
+- PRs: link the research ticket/issue, outline experiment intent, and attach key artifacts—pytest results, WANDB run URLs, and for training behavior changes, a brief loss/throughput comparison. Screenshots only for visualization utilities.
 
 ## Security & Configuration Tips
-Avoid hardcoding secrets: `scripts/hf_token.py` is a placeholder. Store Hugging Face tokens via `huggingface-cli login` or environment variables, and never commit real credentials. Confirm JAX cache directories (`$JAX_COMPILATION_CACHE_DIR`) exist on shared systems before running long jobs.
+- Do not hardcode secrets. `scripts/hf_token.py` is a placeholder—use `huggingface-cli login` or environment variables.
+- Confirm `$JAX_COMPILATION_CACHE_DIR` exists on shared systems before long jobs to avoid recompilation overhead.
+
+## Agent-Specific Instructions
+- This file applies repository-wide; more-nested `AGENTS.md` files may override within their subtree.
+- When modifying code, keep changes minimal and focused; avoid unrelated refactors and never commit real credentials.
+

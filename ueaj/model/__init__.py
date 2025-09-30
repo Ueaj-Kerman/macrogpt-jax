@@ -13,5 +13,8 @@ from ueaj.model.model import *
 # Re-export einsum components for convenience
 from ueaj.model.einsum import *
 
+# LoRA adaptation
+from ueaj.model.lora import *
+
 # Configuration
 from ueaj.model.configs import *

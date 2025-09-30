@@ -3,9 +3,16 @@
 Script to sample from a loaded Llama model.
 """
 import argparse
+import json
 import os
+import sys
 from typing import Optional, List
 from pathlib import Path
+
+# Add project root to path
+script_dir = Path(__file__).parent.absolute()
+project_root = script_dir.parent
+sys.path.insert(0, str(project_root))
 
 import jax
 import jax.numpy as jnp
@@ -13,8 +20,10 @@ from flax import nnx
 from transformers import AutoTokenizer
 from huggingface_hub import snapshot_download, HfFolder
 
-from ueaj.model.model import LlamaModel
-from ueaj.llama.weight_loader import from_pretrained
+from ueaj.model import LlamaModel, apply_lora_to_model
+from ueaj.llama import load_lora_from_peft, save_lora_to_peft, from_pretrained
+from ueaj.llama.weight_loader import create_llama_model_config
+from flax.nnx import rnglib as rng
 
 
 def sample_from_logits(
@@ -232,6 +241,36 @@ def main():
         help="Min-p filtering parameter (e.g., 0.05)",
     )
     parser.add_argument(
+        "--adapter",
+        type=str,
+        default=None,
+        help="HuggingFace LoRA adapter repo or local path (PEFT format)",
+    )
+    parser.add_argument(
+        "--save-random-adapter",
+        type=str,
+        default=None,
+        help="Path to save a randomly initialized LoRA adapter (PEFT format)",
+    )
+    parser.add_argument(
+        "--random-rank",
+        type=int,
+        default=16,
+        help="Rank for randomly initialized LoRA (used with --save-random-adapter)",
+    )
+    parser.add_argument(
+        "--random-alpha",
+        type=float,
+        default=32.0,
+        help="Alpha for randomly initialized LoRA (used with --save-random-adapter)",
+    )
+    parser.add_argument(
+        "--random-std",
+        type=float,
+        default=0.1,
+        help="Stddev for random LoRA params (used with --save-random-adapter)",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -247,48 +286,158 @@ def main():
     parser.add_argument(
         "--use-cache",
         action="store_true",
-        help="Use KV cache for faster generation",
+        help="Reserved flag (no-op)",
     )
-    
+
     args = parser.parse_args()
     
     # Set up JAX
     print(f"JAX devices: {jax.devices()}")
-    
-    # Check if model is a local path or HuggingFace ID
-    if os.path.exists(args.model):
-        model_path = args.model
-    else:
-        # Download from HuggingFace
-        model_path = download_model_if_needed(args.model)
-    
-    # Load tokenizer
-    tokenizer_name = args.tokenizer or args.model
-    print(f"Loading tokenizer: {tokenizer_name}")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    
-    # Determine dtype
+
+    print(f"Loading model: {args.model}")
+    print(f"Using dtype: {args.dtype}")
+
+    # Download base model files (uses cache if available)
+    model_path = snapshot_download(
+        repo_id=args.model,
+        cache_dir=None,
+        allow_patterns=["*.safetensors", "*.json"],
+        ignore_patterns=["*.bin", "*.h5"],
+    )
+
+    # Resolve dtype
     dtype_map = {
         "float32": jnp.float32,
         "float16": jnp.float16,
         "bfloat16": jnp.bfloat16,
     }
-    dtype = dtype_map[args.dtype]
-    
-    # Load model
-    print(f"Loading model from: {model_path}")
-    print(f"Using dtype: {args.dtype}")
-    print(f"Using KV cache: {args.use_cache}")
-    
-    model = from_pretrained(
-        LlamaModel,
-        model_path,
-        dtype=dtype,
-        abstract=False,
-    )
-    
-    print(f"Model loaded successfully!")
-    print(f"Model config: {model.config}")
+    cfg_dtype = dtype_map.get(args.dtype, jnp.bfloat16)
+
+    # Create model structure from HF config
+    model_class = create_llama_model_config(args.model, dtype=cfg_dtype)
+    print("Creating model structure...")
+    model = model_class(rngs=rng.Rngs(0))
+
+    # Build a pure nnx.State from safetensors and merge
+    print("Loading base model weights into model...")
+    model = from_pretrained(model_path, existing_model=model)
+
+    # Load tokenizer early (may be reused for random LoRA sample)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, cache_dir=None)
+    print("Model loaded successfully!")
+
+    # Optionally apply and load a LoRA adapter
+    if args.adapter:
+        print(f"\nLoading LoRA adapter: {args.adapter}")
+        # Download/load adapter files (PEFT format)
+        adapter_path = snapshot_download(
+            repo_id=args.adapter,
+            allow_patterns=["adapter_config.json", "adapter_model.safetensors", "*.json", "*.safetensors"],
+        )
+
+        # Read PEFT adapter config to set rank/alpha and module targets
+        adapter_cfg_path = Path(adapter_path) / "adapter_config.json"
+        if not adapter_cfg_path.exists():
+            raise FileNotFoundError(f"adapter_config.json not found in {adapter_path}")
+
+        with open(adapter_cfg_path, "r") as f:
+            peft_cfg = json.load(f)
+
+        rank = int(peft_cfg.get("r", 16))
+        alpha = float(peft_cfg.get("lora_alpha", 32.0))
+        target_modules = peft_cfg.get("target_modules", None)
+
+        # Map PEFT target module names to substrings in our module paths
+        # e.g., q_proj -> 'q', k_proj -> 'k', embed_tokens -> 'embed_tokens'
+        if isinstance(target_modules, list) and target_modules:
+            mapping = {
+                "q_proj": "q",
+                "k_proj": "k",
+                "v_proj": "v",
+                "o_proj": "o",
+                "up_proj": "up_proj",
+                "down_proj": "down_proj",
+                "gate_proj": "gate_proj",
+                "embed_tokens": "embed_tokens",
+            }
+            targets = [mapping.get(m, m) for m in target_modules]
+        else:
+            targets = None  # Apply to all supported modules (excluding lm_head)
+
+        # Apply LoRA structure (pure: returns a new model copy)
+        model = apply_lora_to_model(
+            model,
+            rank=rank,
+            alpha=alpha,
+            target_modules=targets,
+            rngs=rng.Rngs(0),
+        )
+
+        # Load adapter weights into the model
+        _ = load_lora_from_peft(adapter_path, model=model)
+        print("LoRA adapter loaded.")
+
+    # Optionally create a random LoRA adapter, save it, and verify load
+    if args.save_random_adapter:
+        out_dir = args.save_random_adapter
+        print(f"\nCreating randomly initialized LoRA (rank={args.random_rank}, alpha={args.random_alpha})...")
+        # Apply LoRA structure to a copy
+        model_with_lora = apply_lora_to_model(
+            model,
+            rank=args.random_rank,
+            alpha=args.random_alpha,
+            target_modules=['q', 'k', 'v', 'o'],
+            rngs=rng.Rngs(args.seed),
+        )
+
+        # Randomize LoRA parameters in-place
+        key = jax.random.PRNGKey(args.seed)
+        def rand_like(arr):
+            nonlocal key
+            key, sk = jax.random.split(key)
+            return jax.random.normal(sk, arr.shape, dtype=arr.dtype) * args.random_std
+
+        # For vmapped LoRA modules on attention projections
+        for name in ['q', 'k', 'v', 'o']:
+            mod = getattr(model_with_lora.layers.attn, name)
+            if hasattr(mod, 'lora_A') and hasattr(mod, 'lora_B'):
+                mod.lora_A.value = rand_like(mod.lora_A.value)
+                mod.lora_B.value = rand_like(mod.lora_B.value)
+
+        # Save adapter
+        print(f"Saving random LoRA adapter to: {out_dir}")
+        save_lora_to_peft(model_with_lora, out_dir, base_model_name=args.model)
+
+        # Verify we can load it back into a fresh LoRA-applied copy
+        print("Verifying reload of random LoRA adapter...")
+        verify_model = apply_lora_to_model(
+            model,
+            rank=args.random_rank,
+            alpha=args.random_alpha,
+            target_modules=['q', 'k', 'v', 'o'],
+            rngs=rng.Rngs(args.seed + 1),
+        )
+        _ = load_lora_from_peft(out_dir, model=verify_model)
+
+        # Generate with the random LoRA (likely nonsensical)
+        print("\nRandom LoRA sample (expect nonsensical output):")
+        gen_random = generate(
+            verify_model,
+            tokenizer,
+            args.prompt,
+            max_new_tokens=max(32, args.max_new_tokens // 2),
+            temperature=max(0.8, args.temperature),
+            top_k=args.top_k,
+            top_p=args.top_p,
+            min_p=args.min_p,
+            seed=args.seed + 2,
+        )
+        print(f"\nRandom LoRA generated text:\n{gen_random}")
+
+    # Override tokenizer if specified
+    if args.tokenizer:
+        print(f"Loading custom tokenizer: {args.tokenizer}")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     
     # Generate text
     print(f"\nPrompt: {args.prompt}")
