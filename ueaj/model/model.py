@@ -157,7 +157,7 @@ class LlamaModel(nnx.Module):
 			logits = self.lm_head(activations)
 
 		if self.head_cap == "tanh":
-			logits = 15*jnp.tanh(logits/(15 * jnp.sqrt(self.model_d)))
+			logits = 15*jnp.tanh(logits/15)
 
 		return logits
 

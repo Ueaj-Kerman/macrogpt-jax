@@ -101,6 +101,24 @@ class SliceModule[T]:
 		state = jax.tree.map(lambda x: x[item], state)
 		return nnx.merge(graph_def, state)
 
+	def __setitem__(self, item, value: T):
+		if isinstance(value, nnx.Module):
+			_, value_state = nnx.split(value)
+		else:
+			value_state = value  # Assume it's already a state
+
+		# Get the current module state
+		graph_def, state = nnx.split(self.module)
+
+		# Update the slice in the parent state
+		def set_slice(parent_array, value_array):
+			return parent_array.at[item].set(value_array)
+
+		updated_state = jax.tree.map(set_slice, state, value_state)
+
+		# Merge the updated state back into the module
+		nnx.update(self.module, updated_state)
+
 
 def slice(module: T) -> SliceModule[T]:
 	return SliceModule(module)

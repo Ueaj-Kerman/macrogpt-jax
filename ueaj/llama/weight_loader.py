@@ -4,203 +4,174 @@ Cleaner weight loading utilities for Llama models using regex pattern matching.
 import re
 from pathlib import Path
 from typing import *
+import os
+import json
+import warnings
+import numpy as np
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from flax.nnx import rnglib as rng
 
+# HuggingFace imports
+try:
+    from transformers import AutoConfig, AutoTokenizer
+    from huggingface_hub import snapshot_download
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+    warnings.warn("transformers or huggingface_hub not available. HuggingFace loading will not work.")
 
-class WeightMapper:
-    """Maps HuggingFace weight names to model attributes using regex patterns."""
-    
-    def __init__(self, model):
-        self.model = model
-        self.config = model.config
-        
+
+# Removed old WeightMapper (state-based) in favor of direct in-place loading
+
+
+class ModelWeightMapper:
+    """Maps HuggingFace weight names directly into a live nnx.Module.
+
+    This mapper mutates the provided model's parameters in place.
+    """
+
+    def __init__(self, target_model):
+        self.model = target_model
+
+        # Extract config info from model structure
+        self.model_d = target_model.model_d
+        self.kv_heads = target_model.layers.attn.kv_heads
+        self.kv_q_ratio = target_model.layers.attn.kv_q_ratio
+        self.kq_d = target_model.layers.attn.kq_d
+
+        # Determine dtype from embedding
+        embed = target_model.embed_tokens
+        if hasattr(embed, 'base'):
+            self.dtype = embed.base.embedding.value.dtype
+        else:
+            self.dtype = embed.embedding.value.dtype
+
         # Track fused MLP weights that need to be combined
-        self.pending_fused_weights = {}
-        
-        # Define weight mapping patterns
+        self.pending_fused_weights: Dict[str, Dict[str, jax.Array]] = {}
+
+        # Patterns
         self.patterns = [
-            # Embeddings
             (r"^model\.embed_tokens\.weight$", self._set_embed_tokens),
-            
-            # Layer components
             (r"^model\.layers\.(\d+)\.self_attn\.(q|k|v|o)_proj\.weight$", self._set_attention_weight),
             (r"^model\.layers\.(\d+)\.mlp\.(gate|up|down)_proj\.weight$", self._set_mlp_weight),
             (r"^model\.layers\.(\d+)\.(input_layernorm|post_attention_layernorm)\.weight$", self._set_layer_norm),
-            
-            # Final components
             (r"^model\.norm\.weight$", self._set_final_norm),
             (r"^lm_head\.weight$", self._set_lm_head),
         ]
-        
-        # Compile patterns for efficiency
         self.compiled_patterns = [(re.compile(pattern), handler) for pattern, handler in self.patterns]
-    
+
     def set_weight(self, key: str, value: jax.Array) -> bool:
-        """
-        Set a weight in the model based on the key.
-        
-        Returns:
-            True if weight was set, False if key was not recognized
-        """
         for pattern, handler in self.compiled_patterns:
-            match = pattern.match(key)
-            if match:
-                handler(match, value)
+            m = pattern.match(key)
+            if m:
+                handler(m, value)
                 return True
         return False
-    
+
     def _set_embed_tokens(self, match: re.Match, value: jax.Array):
-        """Set embedding weights."""
-        self.model.embed_tokens.embedding.value = value.astype(self.config.tensor_config.dtype)
-    
+        self.model.embed_tokens.embedding.value = value.astype(self.dtype)
+
     def _set_attention_weight(self, match: re.Match, value: jax.Array):
-        """Set attention projection weights."""
         layer_idx = int(match.group(1))
         proj_type = match.group(2)
-        
+
         if proj_type == "q":
-            # Reshape Q projection: (num_heads * head_dim, hidden_size) -> (hidden_size, num_kv_heads, kv_q_ratio, head_dim)
-            q_weight = value.T.reshape(
-                self.config.model_d,
-                self.config.layer_config.attention_config.kv_heads,
-                self.config.layer_config.attention_config.kv_q_ratio,
-                self.config.layer_config.attention_config.kq_d
-            )
-            self.model.layers.attn.q.w_1.value = self.model.layers.attn.q.w_1.value.at[layer_idx].set(q_weight.astype(self.config.tensor_config.dtype))
-            
-        elif proj_type in ["k", "v"]:
-            # Check if using fused KV
-            if self.config.layer_config.attention_config.fused:
-                # For fused KV, we need to handle K and V together
-                # Reshape: (num_kv_heads * head_dim, hidden_size) -> (hidden_size, num_kv_heads, head_dim)
-                weight = value.T.reshape(
-                    self.config.model_d,
-                    self.config.layer_config.attention_config.kv_heads,
-                    self.config.layer_config.attention_config.kq_d
-                )
-                
+            q_weight = value.T.reshape(self.model_d, self.kv_heads, self.kv_q_ratio, self.kq_d)
+            q_param = self.model.layers.attn.q.w
+            q_param.value = q_param.value.at[layer_idx].set(q_weight.astype(self.dtype))
+            return
+
+        if proj_type in ["k", "v"]:
+            fused_kv = hasattr(self.model.layers.attn, 'kv')
+            weight = value.T.reshape(self.model_d, self.kv_heads, self.kq_d)
+            if fused_kv:
                 if not hasattr(self, '_kv_buffer'):
                     self._kv_buffer = {}
-                
-                # Store K or V weight temporarily
                 layer_key = f"layer_{layer_idx}"
                 if layer_key not in self._kv_buffer:
                     self._kv_buffer[layer_key] = {}
-                
                 self._kv_buffer[layer_key][proj_type] = weight
-                
-                # If we have both K and V, combine them into fused KV
                 if 'k' in self._kv_buffer[layer_key] and 'v' in self._kv_buffer[layer_key]:
                     k_weight = self._kv_buffer[layer_key]['k']
                     v_weight = self._kv_buffer[layer_key]['v']
-                    
-                    # Stack K and V along the fused dimension: (2, hidden_size, num_kv_heads, head_dim)
                     kv_weight = jnp.stack([k_weight, v_weight], axis=0)
-                    self.model.layers.attn.kv.w_1.value = self.model.layers.attn.kv.w_1.value.at[layer_idx].set(kv_weight.astype(self.config.tensor_config.dtype))
-                    
-                    # Clean up buffer
+                    kv_param = self.model.layers.attn.kv.w
+                    kv_param.value = kv_param.value.at[layer_idx].set(kv_weight.astype(self.dtype))
                     del self._kv_buffer[layer_key]
             else:
-                # Non-fused case: handle K and V separately
-                weight = value.T.reshape(
-                    self.config.model_d,
-                    self.config.layer_config.attention_config.kv_heads,
-                    self.config.layer_config.attention_config.kq_d
-                )
-                if proj_type == "k":
-                    self.model.layers.attn.k.w_1.value = self.model.layers.attn.k.w_1.value.at[layer_idx].set(weight.astype(self.config.tensor_config.dtype))
+                if proj_type == 'k':
+                    k_param = self.model.layers.attn.k.w
+                    k_param.value = k_param.value.at[layer_idx].set(weight.astype(self.dtype))
                 else:
-                    self.model.layers.attn.v.w_1.value = self.model.layers.attn.v.w_1.value.at[layer_idx].set(weight.astype(self.config.tensor_config.dtype))
-            
-        elif proj_type == "o":
-            # Reshape O projection: (hidden_size, hidden_size) -> (kv_heads, kv_q_ratio, head_dim, hidden_size)
-            o_weight = value.reshape(self.config.model_d, self.config.model_d).T
-            o_weight = o_weight.reshape(
-                self.config.layer_config.attention_config.kv_heads,
-                self.config.layer_config.attention_config.kv_q_ratio,
-                self.config.layer_config.attention_config.kq_d,
-                self.config.model_d
-            )
-            self.model.layers.attn.o.w_1.value = self.model.layers.attn.o.w_1.value.at[layer_idx].set(o_weight.astype(self.config.tensor_config.dtype))
-    
+                    v_param = self.model.layers.attn.v.w
+                    v_param.value = v_param.value.at[layer_idx].set(weight.astype(self.dtype))
+            return
+
+        if proj_type == "o":
+            o_weight = value.reshape(self.model_d, self.model_d).T
+            o_weight = o_weight.reshape(self.kv_heads, self.kv_q_ratio, self.kq_d, self.model_d)
+            o_param = self.model.layers.attn.o.w
+            o_param.value = o_param.value.at[layer_idx].set(o_weight.astype(self.dtype))
+
     def _set_mlp_weight(self, match: re.Match, value: jax.Array):
-        """Set MLP projection weights."""
         layer_idx = int(match.group(1))
         proj_type = match.group(2)
-        
-        # Transpose all MLP weights
-        weight = value.T.astype(self.config.tensor_config.dtype)
-        
-        if hasattr(self.model.layers.mlp, "fused_proj"):
-            # Gated MLP with fused projections
+        weight = value.T.astype(self.dtype)
+        if hasattr(self.model.layers.mlp, 'fused_proj'):
             if proj_type in ["gate", "up"]:
-                # Store weights temporarily
                 key = f"layer_{layer_idx}_fused"
                 if key not in self.pending_fused_weights:
                     self.pending_fused_weights[key] = {}
-                
-                # Store the weight
                 self.pending_fused_weights[key][proj_type] = weight
-                
-                # Check if we have both gate and up projections
                 if len(self.pending_fused_weights[key]) == 2:
-                    # Create the fused weight tensor
                     gate_weight = self.pending_fused_weights[key]["gate"]
                     up_weight = self.pending_fused_weights[key]["up"]
-                    
-                    # Stack along the first dimension: shape (2, hidden_size, intermediate_size)
                     fused_weight = jnp.stack([up_weight, gate_weight], axis=0)
-                    self.model.layers.mlp.fused_proj.w_1.value = self.model.layers.mlp.fused_proj.w_1.value.at[layer_idx].set(fused_weight)
-                    
-                    # Clean up
+                    fp_param = self.model.layers.mlp.fused_proj.w
+                    fp_param.value = fp_param.value.at[layer_idx].set(fused_weight)
                     del self.pending_fused_weights[key]
-                    
-            elif proj_type == "down":
-                self.model.layers.mlp.down_proj.w_2.value = self.model.layers.mlp.down_proj.w_2.value.at[layer_idx].set(weight)
+            elif proj_type == 'down':
+                dp_param = self.model.layers.mlp.down_proj.w
+                dp_param.value = dp_param.value.at[layer_idx].set(weight)
         else:
-            # Regular MLP
-            if proj_type == "up":
-                self.model.layers.mlp.up_proj.w_1.value = self.model.layers.mlp.up_proj.w_1.value.at[layer_idx].set(weight)
-            elif proj_type == "down":
-                self.model.layers.mlp.down_proj.w_1.value = self.model.layers.mlp.down_proj.w_1.value.at[layer_idx].set(weight)
-    
+            if proj_type == 'up':
+                up_param = self.model.layers.mlp.up_proj.w
+                up_param.value = up_param.value.at[layer_idx].set(weight)
+            elif proj_type == 'down':
+                down_param = self.model.layers.mlp.down_proj.w
+                down_param.value = down_param.value.at[layer_idx].set(weight)
+
     def _set_layer_norm(self, match: re.Match, value: jax.Array):
-        """Set layer normalization weights."""
         layer_idx = int(match.group(1))
         norm_type = match.group(2)
-        
-        if norm_type == "input_layernorm":
-            self.model.layers.attn_norm.scale.value = self.model.layers.attn_norm.scale.value.at[layer_idx].set(value.astype(self.config.tensor_config.dtype))
-        else:  # post_attention_layernorm
-            self.model.layers.mlp_norm.scale.value = self.model.layers.mlp_norm.scale.value.at[layer_idx].set(value.astype(self.config.tensor_config.dtype))
-    
+        if norm_type == 'input_layernorm':
+            an = self.model.layers.attn_norm.scale
+            an.value = an.value.at[layer_idx].set(value.astype(self.dtype))
+        else:
+            mn = self.model.layers.mlp_norm.scale
+            mn.value = mn.value.at[layer_idx].set(value.astype(self.dtype))
+
     def _set_final_norm(self, match: re.Match, value: jax.Array):
-        """Set final layer norm weight."""
-        self.model.norm.scale.value = value.astype(self.config.tensor_config.dtype)
-    
+        self.model.norm.scale.value = value.astype(self.dtype)
+
     def _set_lm_head(self, match: re.Match, value: jax.Array):
-        """Set language model head weight."""
-        if self.model.lm_head is not None:
-            # Transpose for flax convention
-            self.model.lm_head.kernel.value = value.T.astype(self.config.tensor_config.dtype)
-
-
-def load_weights_from_safetensors(model, safetensor_files):
-    """
-    Load weights into a model from safetensor files using the WeightMapper.
+        if hasattr(self.model, 'lm_head') and self.model.lm_head is not None:
+            self.model.lm_head.w.value = value.T.astype(self.dtype)
     
-    Args:
-        model: The model to load weights into
-        safetensor_files: List of safetensor file paths
+
+
+def load_safetensors_into_model(model_like, safetensor_files) -> Tuple[List[str], List[str]]:
+    """Load safetensors directly into a concrete model (in place).
+
+    Returns:
+        (loaded_keys, skipped_keys)
     """
     from safetensors import safe_open
-    
-    mapper = WeightMapper(model)
-    loaded_keys = []
-    skipped_keys = []
-    
+    mapper = ModelWeightMapper(model_like)
+    loaded_keys: List[str] = []
+    skipped_keys: List[str] = []
     for st_file in safetensor_files:
         with safe_open(st_file, framework="flax") as f:
             for key in f.keys():
@@ -209,7 +180,6 @@ def load_weights_from_safetensors(model, safetensor_files):
                     loaded_keys.append(key)
                 else:
                     skipped_keys.append(key)
-    
     return loaded_keys, skipped_keys
 
 
@@ -233,9 +203,8 @@ def create_llama_model_config(model_id: str, dtype: Optional[jax.typing.DTypeLik
         vocab_size=hf_config.vocab_size,
         model_d=model_d,
         num_layers=hf_config.num_hidden_layers,
-        max_position_embeddings=hf_config.max_position_embeddings,
         tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
-        param_dtype=dtype,
+        head_cap=None,  # Disable logit soft-capping for LLaMA (Gemma 2 feature)
         # Configure transformer layer
         transformer_layer=TransformerLayer.override(
             # Configure attention
@@ -244,76 +213,61 @@ def create_llama_model_config(model_id: str, dtype: Optional[jax.typing.DTypeLik
                 kv_heads=kv_heads,
                 kv_q_ratio=hf_config.num_attention_heads // kv_heads,
                 rope_theta=getattr(hf_config, "rope_theta", 10000.0),
-                attention_scale='sp',  # Use SP scaling for LLaMA models
-                param_dtype=dtype
+                attn_scale='sp',  # Use SP scaling for LLaMA models
             ),
             # Configure MLP
             mlp=GMLP.override(
                 hidden_d=hf_config.intermediate_size,
-                param_dtype=dtype
             ),
             # Configure normalization
             norm=RMSNorm.override(
                 eps=getattr(hf_config, "rms_norm_eps", 1e-5),
-                scale="uncentered",
-                param_dtype=dtype
+                scale_mode='uncentered',  # LLaMA uses uncentered RMSNorm
             )
         ),
         # Configure final norm
         norm=RMSNorm.override(
             eps=getattr(hf_config, "rms_norm_eps", 1e-5),
-            scale="uncentered",
-            param_dtype=dtype
+            scale_mode='uncentered',  # LLaMA uses uncentered RMSNorm
         )
     )
 
 
 def from_pretrained(
-    model_class,
     model_path: str,
     rngs: Optional[rng.Rngs] = None,
     dtype: Optional[jax.typing.DTypeLike] = None,
-    abstract: bool = False,
+    existing_model: Optional[Any] = None,
 ) -> Any:
     """
-    Load a pretrained Llama model from safetensors files.
+    Load pretrained LLaMA weights and modify a concrete model in place.
 
-    Args:
-        model_class: The model class to instantiate (ignored, uses LlamaModel)
-        model_path: Path to directory containing safetensors files
-        rngs: Random number generators
-        dtype: Data type for model parameters
-        abstract: If True, create abstract model without allocating weights
-
-    Returns:
-        Loaded model instance
+    If `existing_model` is provided, its parameters are updated and it is
+    returned. Otherwise a new model is instantiated from HF config,
+    updated with loaded weights, and returned.
     """
     from flax import nnx
-    
+
     if rngs is None:
         rngs = rng.Rngs(0)
 
-    # Create configured model class using override API
-    configured_model_class = create_llama_model_config(model_path, dtype)
-
-    # Create model instance
-    if abstract:
-        model = nnx.eval_shape(lambda: configured_model_class(rngs=rng.Rngs(0)))
-    else:
+    # Ensure a concrete model instance to write into
+    if existing_model is None:
+        configured_model_class = create_llama_model_config(model_path, dtype)
         model = configured_model_class(rngs=rngs)
+    else:
+        model = existing_model
 
-    # Load weights from safetensors
+    # Resolve safetensors
     model_dir = Path(model_path)
     if not model_dir.exists():
         raise ValueError(f"Model directory {model_path} does not exist")
-
-    # Find all safetensors files
     safetensor_files = sorted(model_dir.glob("*.safetensors"))
     if not safetensor_files:
         raise ValueError(f"No safetensors files found in {model_path}")
 
-    # Load weights using the cleaner weight loader
-    loaded_keys, skipped_keys = load_weights_from_safetensors(model, safetensor_files)
+    # Load weights directly into the model in place
+    loaded_keys, skipped_keys = load_safetensors_into_model(model, safetensor_files)
 
     if skipped_keys:
         print(f"Warning: Skipped {len(skipped_keys)} unrecognized keys during weight loading")
@@ -321,3 +275,66 @@ def from_pretrained(
             print(f"Skipped keys: {skipped_keys}")
 
     return model
+
+
+# Removed state_from_pretrained; use from_pretrained for in-place loading
+
+
+def load_llama_from_hf(
+    model_name: str = "meta-llama/Llama-3.2-1B",
+    cache_dir: Optional[str] = None,
+    dtype: Optional[jax.typing.DTypeLike] = None,
+    rngs: Optional[rng.Rngs] = None,
+) -> Tuple[Any, Any]:
+    """Load a LLaMA model and tokenizer from HuggingFace.
+
+    This is the main entry point for loading pretrained LLaMA models. It handles:
+    - Downloading from HuggingFace (or using cached models)
+    - Loading tokenizer
+    - Creating model with correct configuration
+    - Loading weights via in-place mapper
+
+    Args:
+        model_name: HuggingFace model ID (e.g., "meta-llama/Llama-3.2-1B")
+        cache_dir: Optional cache directory for downloads
+        dtype: Optional dtype for model weights (default: from model config)
+        rngs: Optional RNG state (default: Rngs(0))
+
+    Returns:
+        Tuple of (model, tokenizer)
+
+    Example:
+        >>> model, tokenizer = load_llama_from_hf("meta-llama/Llama-3.2-1B")
+        >>> tokens = tokenizer("Hello world", return_tensors="np")["input_ids"]
+        >>> logits = model(tokens)
+    """
+    if not HF_AVAILABLE:
+        raise ImportError(
+            "HuggingFace libraries not available. "
+            "Install with: pip install transformers huggingface_hub"
+        )
+
+    print(f"Loading {model_name} from HuggingFace...")
+
+    # Download model files
+    print("Downloading model files...")
+    model_path = snapshot_download(
+        repo_id=model_name,
+        cache_dir=cache_dir,
+        allow_patterns=["*.safetensors", "*.json"],
+    )
+
+    # Load tokenizer
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+
+    # Load model using from_pretrained
+    print("Creating corresponding JAX model...")
+    print("Loading weights from safetensors...")
+    model = from_pretrained(
+        model_path,
+        rngs=rngs,
+        dtype=dtype,
+    )
+
+    return model, tokenizer
