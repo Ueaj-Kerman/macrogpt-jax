@@ -3,10 +3,9 @@ BACKLOG.md
 *.iml
 *.ipr
 *.iws
-hf_token.py
 ueaj/train/wandb
 __pycache__/
 *.pyc
 wandb/
-hf_token.py
 *.safetensors
+CLAUDE.md
