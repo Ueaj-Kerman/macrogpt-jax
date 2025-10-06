@@ -3,7 +3,6 @@ BACKLOG.md
 *.iml
 *.ipr
 *.iws
-CLAUDE.md
 hf_token.py
 ueaj/train/wandb
 __pycache__/
