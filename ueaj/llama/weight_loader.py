@@ -338,3 +338,311 @@ def load_llama_from_hf(
     )
 
     return model, tokenizer
+
+
+# ============================================================================
+# PEFT LoRA Import/Export for vLLM compatibility
+# ============================================================================
+
+def save_lora_to_peft(
+    model,
+    output_dir: str,
+    base_model_name: str = "meta-llama/Llama-3.1-8B",
+):
+    """Save LoRA weights to disk in HuggingFace PEFT format.
+
+    Emits per-layer PEFT keys (model.layers.{i}.self_attn.*) for vmapped models.
+    """
+    from pathlib import Path
+    from ueaj.model.lora import LoRAEinsum, LoRAEmbed
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    num_layers = getattr(model, 'num_layers', None)
+    if num_layers is None:
+        raise ValueError("Model must expose num_layers to export LoRA")
+
+    peft_weights: Dict[str, np.ndarray] = {}
+    target_modules = set()
+
+    # Helper to export a vmapped LoRAEinsum module
+    def export_einsum(module, hf_proj_name: str):
+        nonlocal peft_weights
+        A = np.array(module.lora_A.value, dtype=np.float32)
+        B = np.array(module.lora_B.value, dtype=np.float32)
+        # Expected shapes: (L, in, r) and (L, r, out) or with equivalent axes order
+        # Normalize to (L, in, r) and (L, r, out)
+        if A.ndim == 2:
+            A = A[None, ...]
+        if B.ndim == 2:
+            B = B[None, ...]
+        if A.shape[-1] != B.shape[-2]:
+            # swap last two dims of A if needed
+            if A.shape[-2] == B.shape[-2]:
+                A = np.swapaxes(A, -1, -2)
+        # Emit per-layer
+        for i in range(A.shape[0]):
+            a_i = A[i]
+            b_i = B[i]
+            # Flatten any remaining batch dims on A except last (rank)
+            if a_i.ndim > 2:
+                a_i = a_i.reshape(-1, a_i.shape[-1])
+            if b_i.ndim > 2:
+                b_i = b_i.reshape(-1, b_i.shape[-1])
+            peft_weights[f'base_model.model.model.layers.{i}.self_attn.{hf_proj_name}.lora_A.weight'] = a_i.astype(np.float32)
+            peft_weights[f'base_model.model.model.layers.{i}.self_attn.{hf_proj_name}.lora_B.weight'] = b_i.astype(np.float32)
+        target_modules.add(hf_proj_name)
+
+    # Export attention projections if present
+    attn = getattr(model.layers, 'attn', None)
+    if attn is not None:
+        for name, hf_name in [('q', 'q_proj'), ('k', 'k_proj'), ('v', 'v_proj'), ('o', 'o_proj')]:
+            mod = getattr(attn, name, None)
+            if isinstance(mod, LoRAEinsum):
+                export_einsum(mod, hf_name)
+
+    # Export embedding LoRA if present
+    embed = getattr(model, 'embed_tokens', None)
+    if isinstance(embed, LoRAEmbed):
+        A = np.array(embed.lora_A.value, dtype=np.float32)
+        B = np.array(embed.lora_B.value, dtype=np.float32)
+        if A.ndim > 2:
+            A = A.reshape(-1, A.shape[-1])
+        if B.ndim > 2:
+            B = B.reshape(-1, B.shape[-1])
+        peft_weights['base_model.model.model.embed_tokens.lora_A.weight'] = A.astype(np.float32)
+        peft_weights['base_model.model.model.embed_tokens.lora_B.weight'] = B.astype(np.float32)
+        target_modules.add('embed_tokens')
+
+    if not peft_weights:
+        raise ValueError("No LoRA parameters found to export")
+
+    # Infer rank/alpha from one module if available
+    lora_rank = None
+    lora_alpha = None
+    probe = None
+    if attn is not None and isinstance(getattr(attn, 'q', None), LoRAEinsum):
+        probe = attn.q
+    elif isinstance(embed, LoRAEmbed):
+        probe = embed
+    if probe is not None:
+        lora_rank = int(getattr(probe, 'rank', 16))
+        lora_alpha = float(getattr(probe, 'alpha', 32.0))
+    else:
+        lora_rank = 16
+        lora_alpha = 32.0
+
+    # Save weights using safetensors (PyTorch-free)
+    try:
+        from safetensors.numpy import save_file
+        save_file(peft_weights, output_path / "adapter_model.safetensors")
+        print("  - Saved in safetensors format (PyTorch-free)")
+    except ImportError:
+        np.savez(output_path / "adapter_model.npz", **peft_weights)
+        print("  - Saved in numpy format (.npz)")
+
+    # Create PEFT config
+    peft_config = {
+        "base_model_name_or_path": base_model_name,
+        "peft_type": "LORA",
+        "task_type": "CAUSAL_LM",
+        "inference_mode": False,
+        "r": int(lora_rank),
+        "lora_alpha": float(lora_alpha),
+        "lora_dropout": 0.0,
+        "target_modules": sorted(list(target_modules)),
+        "bias": "none",
+        "fan_in_fan_out": False,
+        "modules_to_save": None,
+    }
+
+    with open(output_path / "adapter_config.json", 'w') as f:
+        json.dump(peft_config, f, indent=2)
+
+    print(f"LoRA adapter saved to {output_dir}")
+    print(f"  - Rank: {lora_rank}, Alpha: {lora_alpha}")
+    print(f"  - Target modules: {sorted(target_modules)}")
+    print(f"  - Format: HuggingFace PEFT (compatible with vLLM)")
+
+    return nnx.state(model, nnx.LoRAParam)
+
+
+def load_lora_from_peft(adapter_dir: str, model: nnx.Module = None) -> nnx.State:
+    """Load LoRA weights from HuggingFace PEFT format.
+
+    Args:
+        adapter_dir: Directory containing PEFT adapter
+        model: Optional model with LoRA structure. If provided, loads weights directly.
+
+    Returns:
+        nnx.State that can be merged into a model with nnx.update()
+
+    Example:
+        >>> # Option 1: Get state and merge
+        >>> lora_state = load_lora_from_peft("./my_lora")
+        >>> nnx.update(model, lora_state)
+        >>>
+        >>> # Option 2: Load directly
+        >>> load_lora_from_peft("./my_lora", model=model)
+    """
+    import json
+    from pathlib import Path
+    from flax import nnx
+    from ueaj.model.lora import _build_lora_path_map
+
+    adapter_path = Path(adapter_dir)
+
+    # Load PEFT config
+    with open(adapter_path / "adapter_config.json", 'r') as f:
+        peft_config = json.load(f)
+
+    print(f"Loading LoRA adapter from {adapter_dir}")
+    print(f"  - Rank: {peft_config['r']}, Alpha: {peft_config['lora_alpha']}")
+    target_modules = peft_config.get('target_modules', 'not specified')
+    print(f"  - Target modules: {target_modules}")
+
+    # Load weights - try safetensors first (modern format), then fall back to others
+    safetensors_file = adapter_path / "adapter_model.safetensors"
+    bin_file = adapter_path / "adapter_model.bin"
+    npz_file = adapter_path / "adapter_model.npz"
+
+    if safetensors_file.exists():
+        # Load from safetensors (preferred format)
+        from safetensors import safe_open
+        with safe_open(str(safetensors_file), framework="numpy") as f:
+            peft_weights_np = {key: f.get_tensor(key) for key in f.keys()}
+    elif npz_file.exists():
+        # Load from numpy format
+        peft_weights_np = dict(np.load(npz_file))
+    elif bin_file.exists():
+        # Try torch format (requires torch)
+        try:
+            import torch
+            peft_weights = torch.load(bin_file, map_location='cpu')
+            peft_weights_np = {k: v.numpy() for k, v in peft_weights.items()}
+        except ImportError:
+            raise ImportError("torch is required to load .bin format adapters. Please save in safetensors format instead.")
+    else:
+        raise FileNotFoundError(f"No adapter weights found in {adapter_dir}")
+
+    # If model provided, use direct module-based loading
+    # Strategy: Collect per-layer weights and stack them into batch dimension
+    if model is not None:
+        # Group weights by module path (without layer index)
+        from collections import defaultdict
+        module_weights = defaultdict(lambda: {})  # {module_path: {layer_idx: {lora_A/B: weight}}}
+
+        # First pass: collect weights by module and layer
+        for peft_key, value in peft_weights_np.items():
+            if 'lora_A.weight' not in peft_key and 'lora_B.weight' not in peft_key:
+                continue
+
+            # Parse PEFT key
+            is_a = 'lora_A.weight' in peft_key
+            param_name = 'lora_A' if is_a else 'lora_B'
+
+            # Remove prefixes
+            path_str = peft_key
+            if path_str.startswith('base_model.model.base_model.model.'):
+                path_str = path_str.replace('base_model.model.base_model.model.', '', 1)
+            elif path_str.startswith('base_model.model.'):
+                path_str = path_str.replace('base_model.model.', '', 1)
+            path_str = path_str.replace(f'.{param_name}.weight', '')
+
+            # Parse layer index and module path
+            if 'layers' not in path_str:
+                continue  # Skip non-layer modules for now
+
+            parts = path_str.split('.')
+            layer_idx = int(parts[2])
+
+            # Build module path (without layer index)
+            if 'self_attn' in path_str:
+                if 'q_proj' in path_str:
+                    module_key = 'attn.q'
+                elif 'k_proj' in path_str:
+                    module_key = 'attn.k'
+                elif 'v_proj' in path_str:
+                    module_key = 'attn.v'
+                elif 'o_proj' in path_str:
+                    module_key = 'attn.o'
+                else:
+                    continue
+            elif 'mlp' in path_str:
+                if 'up_proj' in path_str:
+                    module_key = 'mlp.up_proj'
+                elif 'down_proj' in path_str:
+                    module_key = 'mlp.down_proj'
+                elif 'gate_proj' in path_str:
+                    module_key = 'mlp.gate_proj'
+                else:
+                    continue
+            else:
+                continue
+
+            # PEFT format matches our format - no transpose needed!
+            # PEFT: lora_A (in_features, rank), lora_B (rank, out_features)
+            # Ours: lora_A (in_features, rank), lora_B (rank, out_features)
+
+            # Store in grouped structure
+            if layer_idx not in module_weights[module_key]:
+                module_weights[module_key][layer_idx] = {}
+            module_weights[module_key][layer_idx][param_name] = value
+
+        # Second pass: stack weights and set them
+        modules_updated = 0
+        num_layers = getattr(model, 'num_layers', 16)  # Default to 16 if not specified
+
+        for module_key, layer_weights in module_weights.items():
+            try:
+                # Navigate to the module
+                parts = module_key.split('.')
+                lora_module = model.layers
+                for part in parts:
+                    lora_module = getattr(lora_module, part)
+
+                # Check if module has LoRA parameters
+                if not (hasattr(lora_module, 'lora_A') and hasattr(lora_module, 'lora_B')):
+                    continue
+
+                # Stack weights for all layers
+                lora_a_layers = []
+                lora_b_layers = []
+                for layer_idx in range(num_layers):
+                    if layer_idx in layer_weights:
+                        lora_a_layers.append(layer_weights[layer_idx].get('lora_A'))
+                        lora_b_layers.append(layer_weights[layer_idx].get('lora_B'))
+                    else:
+                        # If missing, use zeros (though this shouldn't happen)
+                        if 'lora_A' in layer_weights[0]:
+                            lora_a_layers.append(np.zeros_like(layer_weights[0]['lora_A']))
+                            lora_b_layers.append(np.zeros_like(layer_weights[0]['lora_B']))
+
+                # Stack along batch dimension and convert to JAX
+                if lora_a_layers[0] is not None:
+                    lora_a_stacked = np.stack(lora_a_layers, axis=0)  # (num_layers, ...)
+                    lora_b_stacked = np.stack(lora_b_layers, axis=0)
+
+                    # Convert to JAX bfloat16
+                    lora_a_jax = jnp.array(lora_a_stacked.astype(np.float32)).astype(jnp.bfloat16)
+                    lora_b_jax = jnp.array(lora_b_stacked.astype(np.float32)).astype(jnp.bfloat16)
+
+                    # Set the stacked weights
+                    lora_module.lora_A.value = lora_a_jax
+                    lora_module.lora_B.value = lora_b_jax
+                    modules_updated += 1
+
+            except (AttributeError, KeyError) as e:
+                continue
+
+        print(f"Loaded {modules_updated} LoRA modules")
+
+        # Return the updated LoRA state
+        return nnx.state(model, nnx.LoRAParam)
+
+    else:
+        raise NotImplementedError(
+            "Loading LoRA without a model is not yet implemented. "
+            "Please pass the model as an argument: load_lora_from_peft(path, model=model)"
+        )

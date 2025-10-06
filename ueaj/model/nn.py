@@ -1,4 +1,5 @@
 """Custom activation functions."""
+import jax.nn
 import jax.numpy as jnp
 
 def relu_squared(x):
