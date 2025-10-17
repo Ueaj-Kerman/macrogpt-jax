@@ -1,0 +1,18 @@
+{
+  "base_model_name_or_path": "meta-llama/Llama-3.2-1B",
+  "peft_type": "LORA",
+  "task_type": "CAUSAL_LM",
+  "inference_mode": false,
+  "r": 16,
+  "lora_alpha": 32.0,
+  "lora_dropout": 0.0,
+  "target_modules": [
+    "k_proj",
+    "o_proj",
+    "q_proj",
+    "v_proj"
+  ],
+  "bias": "none",
+  "fan_in_fan_out": false,
+  "modules_to_save": null
+}
