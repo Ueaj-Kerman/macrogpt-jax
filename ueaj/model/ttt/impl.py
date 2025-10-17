@@ -22,7 +22,8 @@ def make_scan_fn(fwd_fn, distance=True):
 		dstate, = dstate_fn(dv)  # Unpack tuple: (grad_state, grad_k) -> grad_state
 
 		# todo optimizer - use actual gradient, not sign
-		state = jax.tree.map(lambda a, b: a + .05*jax.nn.tanh(b), state, dstate)
+		wd, lr = .1, .01
+		state = jax.tree.map(lambda a, b: (1-wd*lr)*a + lr*jax.nn.tanh(b), state, dstate)
 
 		return state, o
 	return update_fn
@@ -63,14 +64,10 @@ def ttt(fwd_fn, surrogate=True):
 
 			# Wrap fwd_scan to return (o, new_state) with new_state as auxiliary
 			def fwd_scan_for_vjp(state, q):
-				new_state, o = fwd_scan(state, (k, v, q))
-				return o, new_state
+				return fwd_scan(state, (k, v, q))
 
-			# Empirically, has_aux=True returns 3 values: (output, vjp_fn, aux)
-			o, q_update_jvp, new_state = jax.vjp(fwd_scan_for_vjp, state, q, has_aux=True)
-			new_dstate, dq = q_update_jvp(do)
-
-			new_dstate = jax.tree.map(lambda a, b: a+b, dstate, new_dstate)
+			(new_state, o), q_update_jvp = jax.vjp(fwd_scan_for_vjp, state, q)
+			new_dstate, dq = q_update_jvp((dstate, do))
 
 			return (new_state, new_dstate), (o, dq)
 
