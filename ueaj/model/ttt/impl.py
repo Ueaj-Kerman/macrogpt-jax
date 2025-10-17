@@ -27,11 +27,7 @@ def make_scan_fn(fwd_fn, distance=True):
 		return state, o
 	return update_fn
 
-def ttt(fwd_fn):
-	@jax.custom_vjp
-	def ttt_inner(k: jax.Array, v: jax.Array, q: jax.Array, state):
-		return _ttt_fwd(k, v, q, state)[0]
-
+def ttt(fwd_fn, surrogate=True):
 	fwd_scan = make_scan_fn(fwd_fn, distance=True)
 
 	def _ttt_fwd(k: jax.Array, v: jax.Array, q: jax.Array, state):
@@ -40,7 +36,17 @@ def ttt(fwd_fn):
 		new_state, o_seq = jax.lax.scan(fwd_scan, state, (k_seq, v_seq, q_seq))
 
 		o = o_seq.swapaxes(0, 1)
-		return o, (k_seq, v_seq, q_seq, state)
+		if surrogate:
+			return o, (k_seq, v_seq, q_seq, state)
+		else:
+			return o, None
+
+	if not surrogate:
+		return _ttt_fwd
+
+	@jax.custom_vjp
+	def ttt_inner(k: jax.Array, v: jax.Array, q: jax.Array, state):
+		return _ttt_fwd(k, v, q, state)[0]
 
 	v_scan = make_scan_fn(fwd_fn, distance=False)
 	k_fwd_fn = make_reverse_fn(fwd_fn)
