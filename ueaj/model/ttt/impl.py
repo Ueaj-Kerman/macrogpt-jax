@@ -8,22 +8,22 @@ def make_reverse_fn(fwd_fn):
 	def run_vjp(state, x):
 		q, do = x
 		o, dq_fn = jax.vjp(fn.partial(fwd_fn, state), q)
-		return dq_fn(do)[0]  # Unpack tuple: (grad_q,) -> grad_q
+		return dq_fn(do)[0]
 	return run_vjp
 
 
-def make_scan_fn(fwd_fn, distance=True):
+def make_scan_fn(fwd_fn, distance=True, n_iters=1, wd=.1, lr=.01):
 	def update_fn(state, x):
 		k, v, q = x
 		o = fwd_fn(state, q)
 
-		v_pred, dstate_fn = jax.vjp(lambda state: fwd_fn(state, k), state)
-		dv = (v - v_pred) if distance else v
-		dstate, = dstate_fn(dv)  # Unpack tuple: (grad_state, grad_k) -> grad_state
+		for _ in range(n_iters):
+			v_pred, dstate_fn = jax.vjp(lambda state: fwd_fn(state, k), state)
+			dv = (v - v_pred) if distance else v
+			dstate, = dstate_fn(dv)
 
-		# todo optimizer - use actual gradient, not sign
-		wd, lr = .1, .01
-		state = jax.tree.map(lambda a, b: (1-wd*lr)*a + lr*jax.nn.tanh(b), state, dstate)
+			# todo optimizer
+			state = jax.tree.map(lambda a, b: (1-wd*lr)*a + lr*jax.nn.tanh(b), state, dstate)
 
 		return state, o
 	return update_fn
@@ -34,9 +34,7 @@ def ttt(fwd_fn, surrogate=True):
 	def _ttt_fwd(k: jax.Array, v: jax.Array, q: jax.Array, state):
 		k_seq, v_seq, q_seq = k.swapaxes(0, 1), v.swapaxes(0, 1), q.swapaxes(0, 1)
 
-		jax.debug.print("Start of state {}", state)
 		new_state, o_seq = jax.lax.scan(fwd_scan, state, (k_seq, v_seq, q_seq))
-		jax.debug.print("End of state {}", new_state)
 
 		o = o_seq.swapaxes(0, 1)
 		if surrogate:
@@ -51,9 +49,13 @@ def ttt(fwd_fn, surrogate=True):
 	def ttt_inner(k: jax.Array, v: jax.Array, q: jax.Array, state):
 		return _ttt_fwd(k, v, q, state)[0]
 
-	v_scan = make_scan_fn(fwd_fn, distance=True)
-	k_fwd_fn = make_reverse_fn(fwd_fn)
-	k_scan = make_scan_fn(k_fwd_fn, distance=True)
+	v_scan = make_scan_fn(fwd_fn, distance=False)
+	# Train a backwards pass module
+	# k_fwd_fn = make_reverse_fn(fwd_fn)
+	# k_scan = make_scan_fn(k_fwd_fn, distance=False)
+
+	# Regular module for key
+	k_scan = make_scan_fn(fwd_fn, distance=True)
 	def _ttt_bwd(res, do):
 		k_seq, v_seq, q_seq, state = res
 		do_seq = do.swapaxes(0, 1)
@@ -62,11 +64,7 @@ def ttt(fwd_fn, surrogate=True):
 			k, v, q, do = x
 			state, dstate = carry
 
-			# Wrap fwd_scan to return (o, new_state) with new_state as auxiliary
-			def fwd_scan_for_vjp(state, q):
-				return fwd_scan(state, (k, v, q))
-
-			(new_state, o), q_update_jvp = jax.vjp(fwd_scan_for_vjp, state, q)
+			(new_state, o), q_update_jvp = jax.vjp(lambda state, q: fwd_scan(state, (k, v, q)), state, q)
 			new_dstate, dq = q_update_jvp((dstate, do))
 
 			return (new_state, new_dstate), (o, dq)
@@ -77,19 +75,24 @@ def ttt(fwd_fn, surrogate=True):
 
 		def kv_scan(carry, x):
 			k_state, v_state = carry
-			k, v, q, do, dq = x
+			k, v, q, o, do, dq = x
 
 			new_v_state, dv = v_scan(v_state, (q, do, k))
-			new_k_state, dk = k_scan(k_state, ((q, do), dq, (k, dv)))
+			# new_k_state, dk = k_scan(k_state, ((q, o+do), dq, (k, v+dv)))
+			new_k_state, dk = k_scan(k_state, (q, q+dq, k))
 
 			return (new_k_state, new_v_state), (dk, dv)
 
-		(_, _), (dk_seq, dv_seq) = jax.lax.scan(kv_scan, (end_state, end_state), (k_seq, v_seq, q_seq, do_seq, dq_seq), reverse=True)
+		# todo no special case
+		k_state = jax.tree.map(lambda x: x, end_state)
+		k_state.down_proj = jax.tree.map(jnp.zeros_like, k_state.down_proj)
+
+		v_state = jax.tree.map(lambda x: x, end_state)
+		v_state.down_proj = jax.tree.map(jnp.zeros_like, v_state.down_proj)
+
+		(_, _), (dk_seq, dv_seq) = jax.lax.scan(kv_scan, (k_state, v_state), (k_seq, v_seq, q_seq, o_seq, do_seq, dq_seq), reverse=True)
 
 		dq, dk, dv = dq_seq.swapaxes(0, 1), dk_seq.swapaxes(0, 1), dv_seq.swapaxes(0, 1)
-		jax.debug.print("dq {}", dq)
-		jax.debug.print("dk {}", dk)
-		jax.debug.print("dv {}", dv)
 		return dk, dv, dq, dstate
 
 	ttt_inner.defvjp(_ttt_fwd, _ttt_bwd)
