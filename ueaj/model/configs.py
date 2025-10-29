@@ -48,25 +48,28 @@ def format_param_count(count: int) -> str:
 def ueaj_model(vocab_size: int, model_d: int, num_layers: int, kq_ratio: int = 1, kq_d=64):
 	"""Create UEAJ model configuration using override pattern."""
 	from ueaj.model import SoftmaxAttention
-	from ueaj.model import MLP
+	from ueaj.model import GMLP
 	from ueaj.model import TransformerLayer
 	from ueaj.model import LlamaModel
+	from ueaj.model import RMSNorm
+
+	norm = RMSNorm.override(scale_mode="scalar")
 
 	# Return the overridden model class
 	return LlamaModel.override(
 		vocab_size=vocab_size,
 		model_d=model_d,
 		num_layers=num_layers,
+		norm=norm,
 		transformer_layer=TransformerLayer.override(
+			attn_norm=norm,
+			mlp_norm=norm,
 			attn=SoftmaxAttention.override(
 				kq_d=kq_d,
 				kv_heads=model_d // (kq_d*2),
 				kv_q_ratio=kq_ratio,
 				rope_theta=2_000.0,
-				act_fn=relu_squared,
-			),
-			mlp=MLP.override(
-				act_fn=relu_squared,
+				act_fn=jax.nn.gelu,
 			),
 		)
 	)

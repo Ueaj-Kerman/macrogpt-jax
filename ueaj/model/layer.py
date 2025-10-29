@@ -19,7 +19,8 @@ class TransformerLayer(nnx.Module):
 		model_d: int,
 		attn: Callable = SoftmaxAttention,
 		mlp: Callable = GMLP,
-		norm: Callable = RMSNorm,
+		attn_norm: Callable = RMSNorm,
+		mlp_norm: Callable = RMSNorm,
 		*,
 		rngs: rng.Rngs,
 		mesh: Optional[jax.sharding.Mesh] = None,
@@ -29,8 +30,8 @@ class TransformerLayer(nnx.Module):
 		# Initialize components directly - they should be pre-configured with override
 		self.attn = attn(model_d=model_d, rngs=rngs, mesh=mesh)
 		self.mlp = mlp(model_d=model_d, rngs=rngs, mesh=mesh)
-		self.attn_norm = norm(model_d=model_d, rngs=rngs, mesh=mesh)
-		self.mlp_norm = norm(model_d=model_d, rngs=rngs, mesh=mesh)
+		self.attn_norm = attn_norm(model_d=model_d, rngs=rngs, mesh=mesh)
+		self.mlp_norm = mlp_norm(model_d=model_d, rngs=rngs, mesh=mesh)
 		
 		# Store model dimension
 		self.model_d = model_d
