@@ -205,6 +205,10 @@ def _parallel_scan_bwd(
     init_carry, xs, carry_all = residuals
     grad_final_carry, grad_outputs = grads
 
+    # Ensure init_carry and grads are arrays (not scalars)
+    init_carry = tree_map(lambda x: jnp.asarray(x), init_carry)
+    grad_final_carry = tree_map(lambda x: jnp.asarray(x), grad_final_carry)
+
     seq_len = _get_seq_len(xs)
 
     # Build VJP scan function
