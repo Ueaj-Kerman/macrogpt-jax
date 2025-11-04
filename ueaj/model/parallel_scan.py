@@ -10,7 +10,7 @@ Extended with bidirectional support for efficient gradient computation.
 
 import jax
 import jax.numpy as jnp
-from jax import custom_vjp
+from jax import custom_vjp, lax
 from jax.tree_util import tree_map
 from typing import Callable, Tuple, Any, TypeVar
 from functools import partial
@@ -103,9 +103,12 @@ def parallel_scan_iteration(
 
         return jax.vmap(update_single)(carry_prev_all, xs)
 
-    # Run fixed-point iterations
-    for _ in range(num_iterations):
-        carry_all = iteration_step(carry_all)
+    # Run fixed-point iterations using fori_loop (not Python for loop!)
+    # This prevents unrolling and keeps compilation fast
+    def body_fn(i, carry_all):
+        return iteration_step(carry_all)
+
+    carry_all = lax.fori_loop(0, num_iterations, body_fn, carry_all)
 
     # Compute outputs using converged carries
     def compute_output(carry_prev: C, x: X) -> Y:
