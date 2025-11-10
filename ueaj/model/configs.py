@@ -44,7 +44,7 @@ def format_param_count(count: int) -> str:
 		return str(count)
 
 
-def llama3_model(target_params_b: float, vocab_size: int):
+def llama3_model(target_params_b: float, vocab_size: int, tie_embeddings: bool | None = None):
 	"""Create LLaMA 3-style model configuration using scaling laws.
 
 	Uses empirically-derived scaling formulas from Meta's LLaMA 3 family
@@ -54,6 +54,7 @@ def llama3_model(target_params_b: float, vocab_size: int):
 	Args:
 		target_params_b: Target parameter count in billions (e.g., 1.0 for 1B)
 		vocab_size: Vocabulary size (e.g., 50432 for GPT-2, 128256 for LLaMA 3)
+		tie_embeddings: If true, use tied embeddings to initialize the model
 
 	Returns:
 		Model configuration class following LLaMA 3 architectural patterns
@@ -110,7 +111,7 @@ def llama3_model(target_params_b: float, vocab_size: int):
 
 	# Embedding tying: LLaMA 3 pattern is tied for 1B/3B, untied for 8B+
 	# Use tied if target is in the small range
-	tie_word_embeddings = target_params_b < 4.0
+	tie_word_embeddings = target_params_b < 4.0 if tie_embeddings is None else tie_embeddings
 
 	return LlamaModel.override(
 		vocab_size=vocab_size,
@@ -132,8 +133,8 @@ def llama3_model(target_params_b: float, vocab_size: int):
 
 
 # LLaMA 3-style configurations (Meta architecture)
-LLAMA3_150M = llama3_model(0.15, vocab_size=50432)
-LLAMA3_500M = llama3_model(0.5, vocab_size=50432)
+LLAMA3_150M = llama3_model(0.15, vocab_size=50432, tie_embeddings=False)
+LLAMA3_500M = llama3_model(0.5, vocab_size=50432, tie_embeddings=False)
 LLAMA3_1B = llama3_model(1.24, vocab_size=128256)
 LLAMA3_3B = llama3_model(3.21, vocab_size=128256)
 LLAMA3_8B = llama3_model(8.03, vocab_size=128256)
