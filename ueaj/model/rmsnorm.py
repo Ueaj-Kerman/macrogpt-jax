@@ -18,7 +18,7 @@ class RMSNorm(nnx.Module):
 
 	def __init__(self,
 		model_d: int,
-		scale_mode: Literal['centered', 'uncentered', 'scalar', 'none'] = 'centered',
+		scale_mode: Literal['centered', 'uncentered', 'uncentered_scalar', 'centered_scalar', 'none'] = 'uncentered',
 		eps: float = 1e-6,
 		param_dtype: jnp.dtype = jnp.bfloat16,
 		initializer: Optional[Callable] = None,
@@ -36,21 +36,19 @@ class RMSNorm(nnx.Module):
 		if scale_mode == 'none':
 			return
 
-		# Determine shape and default initializer based on scale_mode
-		if scale_mode == 'centered':
-			self.recenter = True
-			shape = (model_d,)
-			default_init = nnx.initializers.zeros
-		elif scale_mode == 'uncentered':
-			self.recenter = False
-			shape = (model_d,)
-			default_init = nnx.initializers.ones
-		elif scale_mode == 'scalar':
-			self.recenter = True
-			shape = ()
-			default_init = nnx.initializers.zeros
-		else:
+		# Parse scale_mode to determine configuration
+		is_scalar = scale_mode.endswith('_scalar')
+		is_centered = scale_mode.startswith('centered')
+
+		# Validate mode
+		valid_modes = {'centered', 'uncentered', 'centered_scalar', 'uncentered_scalar', 'none'}
+		if scale_mode not in valid_modes:
 			raise ValueError(f"Unknown scale_mode: {scale_mode}")
+
+		# Set configuration based on mode
+		self.recenter = is_centered
+		shape = () if is_scalar else (model_d,)
+		default_init = nnx.initializers.zeros if is_centered else nnx.initializers.ones
 
 		# Use provided initializer or the default
 		if initializer is None:
