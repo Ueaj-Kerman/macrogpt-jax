@@ -27,16 +27,35 @@ def this_host_has_first(mesh: jax.sharding.Mesh, axis_name: str) -> bool:
 
 
 class MeshSlice:
-    """Helper for slicing meshes."""
-    
+    """Helper for NumPy-style slicing of JAX device meshes.
+
+    Supports both positional and named (dict-based) axis slicing.
+
+    Positional slicing:
+        >>> sub_mesh = mesh_slice(mesh)[0:2, :]
+
+    Named slicing (more explicit, order-independent):
+        >>> sub_mesh = mesh_slice(mesh)[{'data': slice(0, 2), 'model': 0}]
+        >>> sub_mesh = mesh_slice(mesh)[{'tensor': slice(None, None, 2)}]
+    """
+
     def __init__(self, mesh: jax.sharding.Mesh):
         self.mesh = mesh
-    
+
     def __getitem__(self, key) -> jax.sharding.Mesh:
-        """Slice mesh along axes."""
+        """Slice mesh along axes using NumPy-style indexing or dict-based indexing.
+
+        Supports both positional indexing and named axis indexing:
+        - Positional: mesh_slice(mesh)[0:2, :]
+        - Named dict: mesh_slice(mesh)[{'data': slice(0, 2), 'model': slice(None)}]
+        """
+        # Handle dict-based indexing by axis name
+        if isinstance(key, dict):
+            key = tuple(key.get(axis, _builtin_slice(None)) for axis in self.mesh.axis_names)
+
         if not isinstance(key, tuple):
             key = (key,)
-        
+
         key = key + (_builtin_slice(None),) * (len(self.mesh.axis_names) - len(key))
         
         if len(key) > len(self.mesh.axis_names):
@@ -61,7 +80,35 @@ class MeshSlice:
 
 
 def slice(mesh: jax.sharding.Mesh) -> MeshSlice:
-    """Create a mesh slicer for convenient axis slicing."""
+    """Create a mesh slicer for convenient axis slicing.
+
+    This is the primary interface for slicing JAX meshes. Returns a MeshSlice
+    wrapper that supports NumPy-style indexing or dict-based indexing to extract sub-meshes.
+
+    Args:
+        mesh: The JAX Mesh to slice.
+
+    Returns:
+        MeshSlice wrapper that supports `[]` indexing.
+
+    Example:
+        >>> from ueaj.utils.distutil import slice as mesh_slice
+        >>> import jax
+        >>>
+        >>> mesh = jax.sharding.Mesh(devices.reshape(4, 2), ('data', 'model'))
+        >>>
+        >>> # Positional slicing
+        >>> sub_mesh = mesh_slice(mesh)[0:2, :]
+        >>> data_only = mesh_slice(mesh)[:, 0]
+        >>>
+        >>> # Named slicing (more explicit, order-independent)
+        >>> sub_mesh = mesh_slice(mesh)[{'data': slice(0, 2)}]
+        >>> sub_mesh = mesh_slice(mesh)[{'model': 0}]  # Collapse model axis
+
+    Note:
+        Named 'slice' to provide clean import: `from distutil import slice as mesh_slice`
+        This avoids shadowing Python's built-in `slice` when renamed on import.
+    """
     return MeshSlice(mesh)
 
 

@@ -48,6 +48,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **configurator.py**: `@config` decorator for configuration management
 - **compile.py**: `compile_function` for JAX compilation with detailed memory/FLOP analysis
 - **kvax_context.py**: Context manager for kvax operations
+- **distutil.py**: Distributed utilities for JAX mesh operations
+  - `MeshSlice`: NumPy-style slicing for JAX device meshes
+  - `slice(mesh)`: Create a mesh slicer wrapper
+  - `this_host_has_first()`: Check if current host has first device on an axis
+  - `block_allocations()`: Compute block allocations for distributed training
+  - `blockify()` / `deblockify()`: Pack/unpack parameters into blocked tensor arrays
+  - `shard()`: Apply sharding constraints to blocked arrays
 
 ### Training and Optimization (`ueaj/train/`, `ueaj/opt/`)
 
@@ -254,6 +261,44 @@ save_lora_to_peft(model, "./my_lora_adapter")
 lora_state = load_lora_from_peft("./my_lora_adapter")
 nnx.update(model, lora_state)
 ```
+
+### Mesh Slicing with MeshSlice
+```python
+from ueaj.utils.distutil import slice as mesh_slice
+import jax
+
+# Create a 2D mesh (e.g., data parallel × model parallel)
+devices = jax.devices()
+mesh = jax.sharding.Mesh(
+    devices.reshape(4, 2),
+    ('data', 'model')
+)
+
+# Positional slicing (like NumPy array slicing)
+# Get first 2 data parallel slices, all model parallel devices
+sub_mesh = mesh_slice(mesh)[0:2, :]
+# Result: Mesh with shape (data=2, model=2)
+
+# Index with integer to remove an axis
+sub_mesh = mesh_slice(mesh)[:, 0]
+# Result: Mesh with shape (data=4,) - 'model' axis collapsed
+
+# Dict-based slicing (more explicit, order-independent)
+# Specify slices by axis name
+sub_mesh = mesh_slice(mesh)[{'data': slice(0, 2), 'model': 0}]
+# Result: Mesh with shape (data=2,) - 'model' axis collapsed
+
+# Dict with step (every 2nd device)
+sub_mesh = mesh_slice(mesh)[{'tensor': slice(None, None, 2)}]
+# Unspecified axes default to slice(None) (select all)
+```
+
+**Key behaviors** (ueaj/utils/distutil.py:29-79):
+- **Two syntaxes**: Positional `[0:2, :]` or dict-based `[{'data': slice(0, 2)}]`
+- **Axis preservation**: Slice objects preserve the axis; integers remove it
+- **Dict advantages**: Order-independent, explicit axis names, fewer errors
+- **Auto-padding**: Missing dimensions/axes automatically default to `slice(None)`
+- **Returns new Mesh**: Slices the underlying device array and creates fresh mesh
 
 ## Project Structure
 
