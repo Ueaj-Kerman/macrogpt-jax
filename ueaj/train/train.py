@@ -80,6 +80,30 @@ dataset = datasets.load_dataset(
 	streaming=True,
 )
 
+# Set up JAX distributed if world size > 1
+world_size = int(os.environ.get("WORLD_SIZE", 1))
+world_rank = int(os.environ.get("RANK", 0))
+
+# Initialize JAX distributed runtime
+if world_size > 1:
+	print(f"Initializing JAX distributed: rank {world_rank}/{world_size}")
+	jax.distributed.initialize(
+		coordinator_address=os.environ.get("COORDINATOR_ADDRESS", "localhost:1234"),
+		num_processes=world_size,
+		process_id=world_rank
+	)
+	print(f"JAX distributed initialized. Local devices: {jax.local_device_count()}")
+
+	jax.make_array_from_process_local_data()
+
+	# Create device mesh for data parallelism
+	devices = jax.devices()
+	mesh = jax.sharding.Mesh(devices, ('data',))
+	print(f"Created mesh with shape: {mesh.shape}")
+else:
+	mesh = None
+	print("Running in single-device mode")
+
 # Use the new prepare_dataset function
 print("Setting up train iterator...")
 dataset, (_, _) = data.prepare_dataset(

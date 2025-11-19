@@ -263,15 +263,16 @@ nnx.update(model, lora_state)
 ```
 
 ### Mesh Slicing with MeshSlice
+
 ```python
-from ueaj.utils.distutil import slice as mesh_slice
+from ueaj.utils.distutil import mesh_slice as mesh_slice
 import jax
 
 # Create a 2D mesh (e.g., data parallel × model parallel)
 devices = jax.devices()
 mesh = jax.sharding.Mesh(
-    devices.reshape(4, 2),
-    ('data', 'model')
+	devices.reshape(4, 2),
+	('data', 'model')
 )
 
 # Positional slicing (like NumPy array slicing)
