@@ -130,15 +130,20 @@ def prepare_dataset_distributed(
     from . import pack_documents, batch_iterator, tuple_collate
     from ueaj.utils.distutil import compute_batch_size
 
-    # Determine if this host should load data
-    should_load, _ = compute_batch_size(mesh)
+    # Determine if this host should load data and how many shards
+    should_load, local_shards = compute_batch_size(mesh)
 
     # Determine the number of non-data axes (for the intermediate dimension)
     non_data_axes = [axis for axis in mesh.axis_names if axis != data_axis]
     num_non_data_axes = len(non_data_axes)
 
+    # Calculate total batch size for this host
+    # If a host has multiple data-parallel devices (e.g., both tensor=0 slices in a 2×2 mesh),
+    # it needs to load batch_size * local_shards worth of data
+    local_batch_size = batch_size * local_shards
+
     if should_load:
-        print(f"Host {jax.process_index()}: Loading data from dataset", flush=True)
+        print(f"Host {jax.process_index()}: Loading data from dataset (local_shards={local_shards}, local_batch_size={local_batch_size})", flush=True)
 
         # Tokenize the dataset
         tokenize_fn = create_tokenize_fn(tokenizer, column)
@@ -148,26 +153,26 @@ def prepare_dataset_distributed(
         # Create iterator pipeline
         dataset = tokens_iterator(dataset)
         dataset = pack_documents(dataset, max_length=seq_len, min_fill_ratio=min_fill_ratio, pad_token_id=pad_token_id)
-        dataset = batch_iterator(dataset, batch_size=batch_size, drop_last=True, collate_fn=tuple_collate)
+        dataset = batch_iterator(dataset, batch_size=local_batch_size, drop_last=True, collate_fn=tuple_collate)
 
         # Add intermediate dimension(s) for non-data axes
-        # Shape: (batch_size, seq_len) -> (batch_size, 1, 1, ..., seq_len)
+        # Shape: (local_batch_size, seq_len) -> (local_batch_size, 1, 1, ..., seq_len)
         if num_non_data_axes > 0:
             def reshape_iterator(base_iter):
                 for tokens, doc_ids in base_iter:
                     # Insert dimensions for each non-data axis
-                    new_shape_tokens = (batch_size,) + (1,) * num_non_data_axes + (seq_len,)
-                    new_shape_doc_ids = (batch_size,) + (1,) * num_non_data_axes + (seq_len,)
+                    new_shape_tokens = (local_batch_size,) + (1,) * num_non_data_axes + (seq_len,)
+                    new_shape_doc_ids = (local_batch_size,) + (1,) * num_non_data_axes + (seq_len,)
                     yield (tokens.reshape(new_shape_tokens), doc_ids.reshape(new_shape_doc_ids))
             dataset = reshape_iterator(dataset)
     else:
         print(f"Host {jax.process_index()}: Creating dummy data iterator (will receive via broadcast)", flush=True)
 
         # Create dummy iterator that yields zeros with intermediate dimensions
-        # Shape: (batch_size, 1, 1, ..., seq_len) to match the loading hosts
+        # Shape: (local_batch_size, 1, 1, ..., seq_len) to match the loading hosts
         def dummy_iterator():
             while True:
-                shape = (batch_size,) + (1,) * num_non_data_axes + (seq_len,)
+                shape = (local_batch_size,) + (1,) * num_non_data_axes + (seq_len,)
                 tokens = np.zeros(shape, dtype=np.int32)
                 doc_ids = np.zeros(shape, dtype=np.int32)
                 yield (tokens, doc_ids)
@@ -243,8 +248,12 @@ def prepare_dataset_distributed(
             _ = yield (tokens_dist, doc_ids_dist)
             yield None
 
-    # Create structure descriptors
-    tokens_struct = jax.ShapeDtypeStruct((batch_size, seq_len), jnp.int32)
-    document_ids_struct = jax.ShapeDtypeStruct((batch_size, seq_len), jnp.int32)
+    # Create structure descriptors for global array shape
+    # Global batch size = batch_size (per shard) × number of data-parallel shards
+    data_axis_size = mesh.shape[data_axis]
+    global_batch_size = batch_size * data_axis_size
+
+    tokens_struct = jax.ShapeDtypeStruct((global_batch_size, seq_len), jnp.int32)
+    document_ids_struct = jax.ShapeDtypeStruct((global_batch_size, seq_len), jnp.int32)
 
     return distributed_iterator(), (tokens_struct, document_ids_struct)
