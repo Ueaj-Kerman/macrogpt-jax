@@ -514,14 +514,11 @@ def this_host_has_first(mesh: jax.sharding.Mesh, axis_name: str = 'data') -> boo
 	if axis_name not in mesh.axis_names:
 		raise ValueError(f"Axis '{axis_name}' not found in mesh. Available axes: {mesh.axis_names}")
 
-	# Get devices on axis 0 of the specified axis
+	# Get first device on the specified axis
+	# Build index tuple: 0 for target axis, 0 for all other axes
 	axis_idx = mesh.axis_names.index(axis_name)
-	slicing_key = {name: 0 if i == axis_idx else slice(None)
-				   for i, name in enumerate(mesh.axis_names)}
-	first_slice = MeshSlice(mesh)[slicing_key]
+	index_tuple = tuple(0 for _ in mesh.axis_names)
+	first_device = mesh.devices[index_tuple]
 
-	# Check if any of these devices are local
-	local_devices = set(jax.local_devices())
-	first_devices = set(first_slice.devices.flatten())
-
-	return bool(local_devices & first_devices)
+	# Check if this device is local
+	return first_device in jax.local_devices()

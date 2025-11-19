@@ -128,10 +128,10 @@ def prepare_dataset_distributed(
         ... )
     """
     from . import pack_documents, batch_iterator, tuple_collate
-    from ueaj.utils.distutil import this_host_has_first
+    from ueaj.utils.distutil import compute_batch_size
 
-    # Determine if this host should load data (has first device on data axis)
-    should_load = this_host_has_first(mesh, data_axis)
+    # Determine if this host should load data
+    should_load, _ = compute_batch_size(mesh)
 
     # Determine the number of non-data axes (for the intermediate dimension)
     non_data_axes = [axis for axis in mesh.axis_names if axis != data_axis]
@@ -174,27 +174,6 @@ def prepare_dataset_distributed(
 
         dataset = dummy_iterator()
 
-    # Create JIT-compiled slice-and-reshard function for compute overlap
-    @jax.jit
-    def slice_and_reshard(tokens, doc_ids, target_sharding):
-        """Slice out real data ([:, 0, ...]) and reshard to broadcast.
-
-        This is the key step that extracts only the real data from the first
-        slice of non-data axes and discards the dummy zeros, then broadcasts
-        across all devices via resharding.
-        """
-        # Slice to extract first element along all non-data axes
-        # Example: (batch, 1, seq) -> (batch, seq) via [:, 0, :]
-        # Example: (batch, 1, 1, seq) -> (batch, seq) via [:, 0, 0, :]
-        slice_indices = (slice(None),) + (0,) * num_non_data_axes + (slice(None),)
-        tokens = tokens[slice_indices]
-        doc_ids = doc_ids[slice_indices]
-
-        # Reshard to broadcast across all non-data axes
-        tokens = jax.device_put(tokens, target_sharding)
-        doc_ids = jax.device_put(doc_ids, target_sharding)
-        return tokens, doc_ids
-
     # Determine sharding strategy based on mesh dimensionality
     if len(mesh.axis_names) == 1:
         # Simple 1D data parallelism - no intermediate dimensions needed
@@ -214,6 +193,28 @@ def prepare_dataset_distributed(
         final_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(data_axis, None))
         needs_slice_and_reshard = True
 
+    # Create JIT-compiled slice-and-reshard function for compute overlap
+    # Uses final_sharding from closure
+    @jax.jit
+    def slice_and_reshard(tokens, doc_ids):
+        """Slice out real data ([:, 0, ...]) and reshard to broadcast.
+
+        This is the key step that extracts only the real data from the first
+        slice of non-data axes and discards the dummy zeros, then broadcasts
+        across all devices via resharding.
+        """
+        # Slice to extract first element along all non-data axes
+        # Example: (batch, 1, seq) -> (batch, seq) via [:, 0, :]
+        # Example: (batch, 1, 1, seq) -> (batch, seq) via [:, 0, 0, :]
+        slice_indices = (slice(None),) + (0,) * num_non_data_axes + (slice(None),)
+        tokens = tokens[slice_indices]
+        doc_ids = doc_ids[slice_indices]
+
+        # Reshard to broadcast across all non-data axes
+        tokens = jax.device_put(tokens, final_sharding)
+        doc_ids = jax.device_put(doc_ids, final_sharding)
+        return tokens, doc_ids
+
     def distributed_iterator():
         """Generator that creates distributed arrays and handles slice-and-reshard broadcast."""
         for batch in dataset:
@@ -231,7 +232,7 @@ def prepare_dataset_distributed(
                 #         Shape: (batch, seq) with P('data', None)
                 #         JIT enables compute overlap during resharding
                 tokens_dist, doc_ids_dist = slice_and_reshard(
-                    tokens_array, doc_ids_array, final_sharding
+                    tokens_array, doc_ids_array
                 )
             else:
                 # Simple 1D case: directly create with final sharding
