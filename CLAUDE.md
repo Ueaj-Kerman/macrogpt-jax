@@ -94,39 +94,39 @@ The test suite focuses on optimizer research and numerical precision:
 
 ## Common Commands
 
-**IMPORTANT**: Always use the `scripts/run_python.sh` script to run Python commands to ensure the correct virtual environment is used.
+**IMPORTANT**: Always use `.venv/bin/python` to run Python commands to ensure the correct virtual environment is used.
 
 ### Running Python Scripts
 ```bash
-./scripts/run_python.sh script.py                     # Run a Python script
-./scripts/run_python.sh -m module                     # Run a Python module
-./scripts/run_python.sh -c "print('Hello')"          # Run Python command
+.venv/bin/python script.py                     # Run a Python script
+.venv/bin/python -m module                     # Run a Python module
+.venv/bin/python -c "print('Hello')"          # Run Python command
 ```
 
 ### Testing
 ```bash
 # Run all tests with pytest
-./scripts/run_python.sh -m pytest test/ -q
+.venv/bin/python -m pytest test/ -q
 
 # Run specific test category
-./scripts/run_python.sh -m pytest test/ -k unroll
-./scripts/run_python.sh -m pytest test/ -k fp8
-./scripts/run_python.sh -m pytest test/ -k weight_decay
+.venv/bin/python -m pytest test/ -k unroll
+.venv/bin/python -m pytest test/ -k fp8
+.venv/bin/python -m pytest test/ -k weight_decay
 
 # Run a single test file
-./scripts/run_python.sh -m pytest test/test_unroll_simple.py -v
+.venv/bin/python -m pytest test/test_unroll_simple.py -v
 
 # Quick smoke test for config system
-./scripts/run_python.sh test.py
+.venv/bin/python test.py
 ```
 
 ### Training
 ```bash
 # Launch distributed pretraining with environment variables
-OPTIMIZER=multiscale RUN_NAME=my_run ./scripts/run_python.sh -m ueaj.train.train
+OPTIMIZER=multiscale RUN_NAME=my_run .venv/bin/python -m ueaj.train.train
 
 # Set model path and base learning rate
-OPTIMIZER=muon RUN_NAME=exp_001 MODEL_PATH=./checkpoints BASE_LR=0.025 ./scripts/run_python.sh -m ueaj.train.train
+OPTIMIZER=muon RUN_NAME=exp_001 MODEL_PATH=./checkpoints BASE_LR=0.025 .venv/bin/python -m ueaj.train.train
 
 # Available optimizers: multiscale, muon, adamw
 ```
@@ -134,15 +134,15 @@ OPTIMIZER=muon RUN_NAME=exp_001 MODEL_PATH=./checkpoints BASE_LR=0.025 ./scripts
 ### LoRA Fine-tuning
 ```bash
 # Basic LoRA training (uses UEAJ_150M by default)
-./scripts/run_python.sh scripts/train_lora.py --run-name my_lora
+.venv/bin/python scripts/train_lora.py --run-name my_lora
 
 # LoRA training with customization
-./scripts/run_python.sh scripts/train_lora.py \
+.venv/bin/python scripts/train_lora.py \
     --rank 32 --alpha 64 --lr 1e-4 \
     --max-steps 5000 --output-dir ./my_adapter
 
 # Load pretrained model and apply LoRA (when HF loading is implemented)
-./scripts/run_python.sh scripts/train_lora.py \
+.venv/bin/python scripts/train_lora.py \
     --model meta-llama/Llama-3.2-1B \
     --target-modules q k v o \
     --rank 16 --alpha 32
@@ -151,11 +151,11 @@ OPTIMIZER=muon RUN_NAME=exp_001 MODEL_PATH=./checkpoints BASE_LR=0.025 ./scripts
 ### Text Generation
 ```bash
 # Sample from pretrained model
-./scripts/run_python.sh scripts/sample_llama.py \
+.venv/bin/python scripts/sample_llama.py \
     --prompt "Once upon a time" --max-new-tokens 100
 
 # With temperature and sampling parameters
-./scripts/run_python.sh scripts/sample_llama.py \
+.venv/bin/python scripts/sample_llama.py \
     --prompt "The future of AI" --temperature 0.8 \
     --top-k 50 --top-p 0.9
 ```
@@ -259,8 +259,8 @@ nnx.update(model, lora_state)
 
 ```
 nanollama/
+├── .venv/                # Virtual environment (not committed)
 ├── scripts/              # Executable scripts
-│   ├── run_python.sh     # Python execution wrapper
 │   ├── train_lora.py     # LoRA fine-tuning script
 │   ├── sample_llama.py   # Text generation script
 │   ├── sweep.sh          # Hyperparameter sweeping
@@ -288,7 +288,7 @@ nanollama/
 
 ## Environment Configuration
 
-- **Virtual environment**: `~/venvs/jax-packages` (managed by `scripts/run_python.sh`)
+- **Virtual environment**: `.venv/` in project root (use `.venv/bin/python` for all commands)
 - **JAX compilation cache**: `JAX_COMPILATION_CACHE_DIR=$HOME/tmp/jax_cache`
 - **XLA memory fraction**: `XLA_PYTHON_CLIENT_MEM_FRACTION=.95` (use 95% of available GPU memory)
 - **Triton globals**: `TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1` (required for kvax)
@@ -306,7 +306,7 @@ nanollama/
 - Use short, imperative summaries (e.g., "fix optimizer bug", "add FP8 tests")
 - Group related changes per commit
 - Note major configuration shifts in commit body
-- Before commits, run `./scripts/run_python.sh -m pytest test/ -q` to ensure tests pass
+- Before commits, run `.venv/bin/python -m pytest test/ -q` to ensure tests pass
 
 ### Security
 - **Never commit real credentials**: `scripts/hf_token.py` is a placeholder

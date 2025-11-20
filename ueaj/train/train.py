@@ -1,14 +1,18 @@
 import os
 
-os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
 os.environ["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"] = "1"  # Required for kvax
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=".95"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=".99"
 import wandb
 import gc
 import time
 
 import numpy as np
 import jax
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+
 from jax import numpy as jnp
 from flax import nnx
 from flax.nnx import rnglib as rng
@@ -24,7 +28,7 @@ batch_size, seq_len = 1, 6*8192
 pad_token = 50431
 
 print("Loading tokenizer...")
-tokenizer = transformers.GPT2TokenizerFast.from_pretrained("openai-community/gpt2")
+tokenizer = transformers.LlamaTokenizerFast.from_pretrained("meta-llama/Meta-Llama-3-8B")
 # Set model_max_length properly - this is the attribute that actually controls the warning
 tokenizer.model_max_length = seq_len  # Set to 4096
 print("Vocab Size:", tokenizer.vocab_size)
@@ -35,7 +39,7 @@ document_ids_struct = jax.ShapeDtypeStruct((batch_size, seq_len), jax.numpy.int3
 
 print("Loading model...")
 # Use the default UEAJ configuration
-model = configs.UEAJ_150M(rngs=rng.Rngs(0))
+model = configs.LLAMA3_2B(rngs=rng.Rngs(0))
 
 graph_def, state = nnx.split(model, nnx.Param)
 

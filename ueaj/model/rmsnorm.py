@@ -29,11 +29,11 @@ class RMSNorm(nnx.Module):
 	):
 		super().__init__()
 		self.eps = eps
-		self.scale = None
 		self.recenter = False
 		self.sharding = sharding
 
 		if scale_mode == 'none':
+			self.scale = None
 			return
 
 		# Parse scale_mode to determine configuration
