@@ -48,6 +48,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **configurator.py**: `@config` decorator for configuration management
 - **compile.py**: `compile_function` for JAX compilation with detailed memory/FLOP analysis
 - **kvax_context.py**: Context manager for kvax operations
+- **profiling.py**: JAX profiling utilities for performance analysis
+  - `profile_trace()`: Context manager for TensorBoard/Perfetto profiling
+  - `profile_scope()`: Named scopes within profiling sessions
+  - `profile_function()`: Decorator for profiling functions
+  - `benchmark_function()`: Statistical performance benchmarking
 
 ### Training and Optimization (`ueaj/train/`, `ueaj/opt/`)
 
@@ -159,6 +164,35 @@ OPTIMIZER=muon RUN_NAME=exp_001 MODEL_PATH=./checkpoints BASE_LR=0.025 .venv/bin
     --prompt "The future of AI" --temperature 0.8 \
     --top-k 50 --top-p 0.9
 ```
+
+### Profiling and Performance Analysis
+```bash
+# Profile a training step (generates TensorBoard data)
+.venv/bin/python scripts/profile_training.py
+
+# Profile specific components
+.venv/bin/python scripts/profile_training.py forward      # Forward pass only
+.venv/bin/python scripts/profile_training.py components   # Model components
+.venv/bin/python scripts/profile_training.py benchmark    # Statistical benchmark
+
+# View profiling results in TensorBoard
+.venv/bin/tensorboard --logdir=./profiles
+# Then open: http://localhost:6006
+
+# Profile from Python code
+from ueaj.utils import profile_trace, benchmark_function
+
+# Quick profile
+with profile_trace("./profiles", name="my_operation"):
+    result = expensive_function()
+    result.block_until_ready()
+
+# Statistical benchmark
+stats = benchmark_function(fn, args, num_iterations=100)
+print(f"{stats['mean']:.2f}ms ± {stats['std']:.2f}ms")
+```
+
+See `docs/PROFILING_GUIDE.md` for detailed profiling documentation and `docs/PROFILING_QUICKREF.md` for quick reference.
 
 ## Key Development Patterns
 

@@ -139,6 +139,7 @@ class SoftmaxAttention(nnx.Module, ABC):
 	def window_tuple(self) -> tuple[int, int] | None:
 		return (0, self.window_size) if self.window_size else None
 
+	@functools.partial(jax.named_call, name="attention")
 	def __call__(self, x, **kwargs):
 		position_ids = kwargs.get('position_ids', None)
 		if position_ids is not None:

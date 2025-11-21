@@ -51,3 +51,5 @@ DEFAULT_ACCUM_TYPE = make_config(
 
 from ueaj.utils.gradutils import *
 from ueaj.utils.tensorutil import *
+from ueaj.utils.profiling import *
+from ueaj.utils.profile_config import maybe_profile, get_profiling_config

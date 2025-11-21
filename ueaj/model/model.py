@@ -1,6 +1,7 @@
 """
 Llama model implementation for loading and running Llama models from HuggingFace.
 """
+import functools
 import jax
 
 from ueaj.model.layer import *
@@ -98,6 +99,7 @@ class LlamaModel(nnx.Module):
 			self.lm_head = None
 	
 
+	@functools.partial(jax.named_call, name="get_activations")
 	def get_activations(self, input_ids: jax.Array, mesh: Optional[jax.sharding.Mesh] = None, **kwargs) -> jax.Array:
 		"""
 		Get hidden states without final norm and lm_head projection.
@@ -135,6 +137,7 @@ class LlamaModel(nnx.Module):
 
 		return act
 
+	@functools.partial(jax.named_call, name="get_logits")
 	def get_logits(self, activations: jax.Array) -> jax.Array:
 		"""
 		Apply final norm and lm_head to hidden states.

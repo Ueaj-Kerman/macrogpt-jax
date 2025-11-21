@@ -1,7 +1,7 @@
 import os
 
 os.environ["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"] = "1"  # Required for kvax
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=".99"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", ".85")
 import wandb
 import gc
 import time
@@ -24,11 +24,12 @@ from ueaj.model import configs
 from ueaj.train import (training_utils, optimizer_setup, logging_utils)
 
 # batch_size, seq_len = 5, 4096
-batch_size, seq_len = 1, 6*8192
+batch_size, seq_len = 1, 4*8192
 pad_token = 50431
 
 print("Loading tokenizer...")
-tokenizer = transformers.LlamaTokenizerFast.from_pretrained("meta-llama/Meta-Llama-3-8B")
+# tokenizer = transformers.PreTrainedTokenizerFast.from_pretrained("meta-llama/Meta-Llama-3-8B")
+tokenizer = transformers.GPT2TokenizerFast.from_pretrained("openai-community/gpt2")
 # Set model_max_length properly - this is the attribute that actually controls the warning
 tokenizer.model_max_length = seq_len  # Set to 4096
 print("Vocab Size:", tokenizer.vocab_size)
@@ -39,7 +40,7 @@ document_ids_struct = jax.ShapeDtypeStruct((batch_size, seq_len), jax.numpy.int3
 
 print("Loading model...")
 # Use the default UEAJ configuration
-model = configs.LLAMA3_2B(rngs=rng.Rngs(0))
+model = configs.UEAJ_150M(rngs=rng.Rngs(0))
 
 graph_def, state = nnx.split(model, nnx.Param)
 
@@ -97,6 +98,10 @@ dataset, (_, _) = data.prepare_dataset(
 
 print("Fetching test set...")
 test_tokens, test_doc_ids = next(dataset)
+print(f"  Test tokens shape: {test_tokens.shape}")
+print(f"  Test tokens unique values: {jnp.unique(test_tokens)[:20]}")  # First 20 unique
+print(f"  Test tokens == pad_token: {jnp.sum(test_tokens == pad_token)} / {test_tokens.size}")
+print(f"  Pad token ID: {pad_token}")
 dataset.send(None)
 
 warmup_tokens 		=   	10_000_000
@@ -107,6 +112,14 @@ print("Starting training...")
 model_path = os.environ.get("MODEL_PATH")
 if model_path is not None:
 	print(f"Will write model to {model_path}")
+
+# Profiling configuration
+PROFILE_STEP = os.getenv('PROFILE_STEP')
+PROFILE_DIR = os.getenv('PROFILE_DIR', './profiles')
+
+if PROFILE_STEP is not None:
+	PROFILE_STEP = int(PROFILE_STEP)
+	print(f"📊 Profiling enabled: step={PROFILE_STEP}, dir={PROFILE_DIR}")
 
 trained_tokens = 0
 for i, batch in enumerate(dataset):
@@ -122,10 +135,23 @@ for i, batch in enumerate(dataset):
 	opt_arg = {'lr': jnp.array(base_lr * warmup), 'warmup': warmup}
 	tokens, doc_ids = batch
 
-	state, opt_state, stats = train_fn(
-		graph_def, state, opt_arg, opt_state, tokens,
-		document_ids=doc_ids
-	)
+	# Profile if this is the target step
+	if PROFILE_STEP is not None and i == PROFILE_STEP:
+		profile_path = f"{PROFILE_DIR}/{run_name}_{i:08d}"
+		os.makedirs(profile_path, exist_ok=True)
+		print(f"📊 Profiling step {i} -> {profile_path}")
+
+		with jax.profiler.trace(profile_path, create_perfetto_trace=False):
+			state, opt_state, stats = train_fn(
+				graph_def, state, opt_arg, opt_state, tokens,
+				document_ids=doc_ids
+			)
+			stats['mean_loss'].block_until_ready()
+	else:
+		state, opt_state, stats = train_fn(
+			graph_def, state, opt_arg, opt_state, tokens,
+			document_ids=doc_ids
+		)
 
 	dataset.send(None)
 	gc.collect()
@@ -167,6 +193,9 @@ for i, batch in enumerate(dataset):
 
 	if np.isnan(log_values['mean_loss']):
 		print("Loss is NaN, stopping training...")
+		break
+	elif PROFILE_STEP is not None and i == PROFILE_STEP:
+		print("Emitted profile!")
 		break
 
 if model_path is not None:

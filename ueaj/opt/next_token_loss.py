@@ -95,6 +95,7 @@ def ntp_args(
 	targets = inputs.at[:, :-1].set(inputs[:, 1:])
 	return targets, mask
 
+@jax.named_scope("chunked_loss")
 def chunked_softmax_cross_entropy(
 	inputs: jax.Array,
 	activations: jax.Array,
@@ -160,6 +161,7 @@ def chunked_softmax_cross_entropy(
 	"""
 	targets, mask = ntp_args(inputs, loss_mask=loss_mask, document_ids=document_ids, pad_token_id=pad_token_id)
 
+	@jax.named_scope("chunked_loss")
 	def loss_fn(_, x):
 		activations, targets, mask = x
 		logits = logit_projection(activations, **logit_proj_kwargs)

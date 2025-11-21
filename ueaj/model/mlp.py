@@ -1,3 +1,5 @@
+import functools
+
 from ueaj.model.einsum import *
 from ueaj.utils import *
 from ueaj.utils.configurator import *
@@ -46,6 +48,7 @@ class MLP(nnx.Module):
         )
         self.activation_fn = act_fn
 
+    @functools.partial(jax.named_call, name="mlp")
     def __call__(self, x):
         x = self.up_proj(x)
         x = self.activation_fn(x)
@@ -94,6 +97,7 @@ class GMLP(nnx.Module):
         )
         self.activation_fn = activation_fn
 
+    @functools.partial(jax.named_call, name="gated_mlp")
     def __call__(self, x):
         up, gate = self.fused_proj(x)
         gate = self.activation_fn(gate)
@@ -105,7 +109,7 @@ class GMLP(nnx.Module):
             s = jnp.max(jnp.abs(up), axis=(0, 1), keepdims=True) + 1
             x = (s * up) * gate
             x = x / s
-        
+
         # Apply down projection
         x = self.down_proj(x)
         return x

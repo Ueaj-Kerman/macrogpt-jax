@@ -1,4 +1,5 @@
 import jax
+import functools
 
 from ueaj.model.soft_attn import *
 from ueaj.model.mlp import *
@@ -36,6 +37,7 @@ class TransformerLayer(nnx.Module):
 		# Store model dimension
 		self.model_d = model_d
 
+	@functools.partial(jax.named_call, name="transformer_layer")
 	def __call__(self, x, mesh: Optional[jax.sharding.Mesh] = None, **kwargs):
 		"""
 		Forward pass through the transformer layer.
@@ -49,6 +51,7 @@ class TransformerLayer(nnx.Module):
 		"""
 		# Attention block with residual connection
 		x += self.attn(self.attn_norm(x), **kwargs)
+		# MLP block with residual connection
 		x += self.mlp(self.mlp_norm(x))
 		if mesh is not None:
 			x = jax.lax.with_sharding_constraint(x, jax.NamedSharding(mesh, TENSOR_SHARDING))
