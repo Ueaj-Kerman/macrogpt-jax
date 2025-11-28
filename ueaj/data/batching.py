@@ -263,21 +263,21 @@ if __name__ == "__main__":
     # Test 5: Integration with pack_documents
     print("\n5. Integration example with pack_documents")
     print("-" * 40)
-    
+
     from ueaj.data.packing import pack_documents
-    
+
     def doc_iterator():
         yield np.array([1, 2, 3, 4, 5], dtype=np.int32)
         yield np.array([6, 7, 8], dtype=np.int32)
         yield np.array([9, 10, 11, 12], dtype=np.int32)
         yield np.array([13, 14], dtype=np.int32)
-    
-    # Pack documents
-    packed = pack_documents(doc_iterator(), max_length=8, min_fill_ratio=0.5)
-    
+
+    # Pack documents (linear packing)
+    packed = pack_documents(doc_iterator(), max_length=8)
+
     # Batch the packed sequences
     batches = list(batch_iterator(packed, batch_size=2, collate_fn=tuple_collate))
-    
+
     print(f"Packed and batched sequences:")
     for i, (tokens, doc_ids) in enumerate(batches):
         print(f"\nBatch {i}: shape={tokens.shape}")
