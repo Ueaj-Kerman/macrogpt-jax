@@ -135,6 +135,7 @@ def llama3_model(target_params_b: float, vocab_size: int, tie_embeddings: bool |
 # LLaMA 3-style configurations (Meta architecture)
 LLAMA3_150M = llama3_model(0.15, vocab_size=50432, tie_embeddings=False)
 LLAMA3_500M = llama3_model(0.5, vocab_size=50432, tie_embeddings=False)
+UEAJ_1B = llama3_model(1.24, vocab_size=50432, tie_embeddings=False)
 LLAMA3_1B = llama3_model(1.24, vocab_size=128256)
 LLAMA3_2B = llama3_model(2.20, vocab_size=128256)
 LLAMA3_3B = llama3_model(3.21, vocab_size=128256)
@@ -145,9 +146,13 @@ LLAMA3_70B = llama3_model(70.6, vocab_size=128256)
 LLAMA3_405B = llama3_model(405.0, vocab_size=128256)
 
 # Backwards compatibility alias
-UEAJ_150M = LLAMA3_150M
 
 if __name__ == "__main__":
+	from flax.nnx import rnglib as rng
+	model = nnx.get_abstract_model(lambda: UEAJ_1B(rngs=rng.Rngs(0)), jax.make_mesh((1,), 'data'))
+	model = nnx.merge(*model)
+	print(model.num_layers)
+
 	print("="*80)
 	print("LLaMA 3-style Model Configurations")
 	print("="*80)

@@ -1,8 +1,10 @@
 import os
 
 os.environ["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"] = "1"  # Required for kvax
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", ".85")
-import wandb
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", ".95")
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Use CUDA allocator to avoid fragmentation
+os.environ["XLA_FLAGS"] = os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_triton_gemm=false"  # Use cuBLAS, skip slow autotuning
+
 import gc
 import time
 
@@ -24,7 +26,7 @@ from ueaj.model import configs
 from ueaj.train import (training_utils, optimizer_setup, logging_utils)
 
 # batch_size, seq_len = 5, 4096
-batch_size, seq_len = 1, 4*8192
+batch_size, seq_len = 1, 8192
 pad_token = 50431
 
 print("Loading tokenizer...")
@@ -40,42 +42,60 @@ document_ids_struct = jax.ShapeDtypeStruct((batch_size, seq_len), jax.numpy.int3
 
 print("Loading model...")
 # Use the default UEAJ configuration
-model = configs.UEAJ_150M(rngs=rng.Rngs(0))
+run_name = os.environ.get("PROFILE_SETUP", "False")
+if run_name == "True":
+	manager = jax.profiler.trace("./init", create_perfetto_trace=False)
+else:
+	import contextlib
+	manager = contextlib.nullcontext()
 
-graph_def, state = nnx.split(model, nnx.Param)
+with manager:
+	print(f"Initializing optimizer {optimizer_setup.get_optimizer_name()}...")
+	base_lr = float(os.environ.get("BASE_LR", 0.025))
+	print(f"Using base learning rate: {base_lr}")
+	opt_arg_0 = {'lr': jnp.array(base_lr), 'warmup': jnp.array(1.)}
 
-print(f"Initializing optimizer {optimizer_setup.get_optimizer_name()}...")
-base_lr = float(os.environ.get("BASE_LR", 0.025))
-print(f"Using base learning rate: {base_lr}")
-opt_arg_0 = {'lr': jnp.array(base_lr), 'warmup': jnp.array(1.)}
-# Convert params to fp32 for optimizer (master weights)
-state = jax.tree.map(lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x, state)
+	@jax.jit
+	def make_state():
+		model = configs.UEAJ_1B(rngs=rng.Rngs(0))
+		graph_def, state = nnx.split(model, nnx.Param) # todo handle other categories
+		# Convert params to fp32 for optimizer (master weights)
+		state = jax.tree.map(lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x, state)
+		return graph_def, state
 
-opt_dtype=jnp.float32
+	graph_def, state = make_state()
 
-gc.collect()
-opt_state = optimizer_setup.make_optimizer(**opt_arg_0, model=model, dtype=opt_dtype).init(state)
+	model = nnx.merge(graph_def, state)
+	graph_def, state = nnx.split(model, nnx.Param)
 
-print(jax.tree.map(lambda x: (x.shape, x.dtype), opt_state))
 
-# Compile all training functions
-gc.collect()
-test_compiled, train_step_fast, train_step_stats = training_utils.compile_training_functions(
-	graph_def=graph_def,
-	state=state,
-	make_optimizer=optimizer_setup.make_optimizer.override(dtype=opt_dtype),
-	opt_arg_0=opt_arg_0,
-	opt_state=opt_state,
-	tokens_struct=tokens_struct,
-	document_ids_struct=document_ids_struct,
-	pad_token=pad_token,
-)
+	opt_dtype=jnp.float32
+
+	opt_state = optimizer_setup.make_optimizer(**opt_arg_0, model=model, dtype=opt_dtype).init(state)
+
+	print(jax.tree.map(lambda x: (x.shape, x.dtype), opt_state))
+
+	# Compile all training functions
+	test_compiled, train_step_fast, train_step_stats = training_utils.compile_training_functions(
+		graph_def=graph_def,
+		state=state,
+		make_optimizer=optimizer_setup.make_optimizer.override(dtype=opt_dtype),
+		opt_arg_0=opt_arg_0,
+		opt_state=opt_state,
+		tokens_struct=tokens_struct,
+		document_ids_struct=document_ids_struct,
+		pad_token=pad_token,
+	)
 
 run_name = os.environ.get("RUN_NAME")
 if run_name is None:
-	run_name = input("Enter a run ID: ")
-else:
+	run_name = input("Enter a run ID (or press Enter to skip wandb): ").strip() or None
+
+wandb_enabled = run_name and run_name.lower() not in ('null', 'none', '')
+if wandb_enabled:
 	print(f"Using run name: {run_name}")
+else:
+	print("No run name - wandb logging disabled")
 
 print("Loading dataset...")
 dataset = datasets.load_dataset(
@@ -104,7 +124,7 @@ print(f"  Test tokens == pad_token: {jnp.sum(test_tokens == pad_token)} / {test_
 print(f"  Pad token ID: {pad_token}")
 dataset.send(None)
 
-warmup_tokens 		=   	10_000_000
+warmup_tokens 		=   	 1_000_000
 cooldown_tokens 	=	   100_000_000
 max_train_tokens	=	10_000_000_000
 
@@ -136,6 +156,7 @@ for i, batch in enumerate(dataset):
 	tokens, doc_ids = batch
 
 	# Profile if this is the target step
+	schedule_start_time = time.time()
 	if PROFILE_STEP is not None and i == PROFILE_STEP:
 		profile_path = f"{PROFILE_DIR}/{run_name}_{i:08d}"
 		os.makedirs(profile_path, exist_ok=True)
@@ -148,13 +169,21 @@ for i, batch in enumerate(dataset):
 			)
 			stats['mean_loss'].block_until_ready()
 	else:
+
 		state, opt_state, stats = train_fn(
 			graph_def, state, opt_arg, opt_state, tokens,
 			document_ids=doc_ids
 		)
+	schedule_end_time = time.time()
 
+
+
+	data_start_time = time.time()
 	dataset.send(None)
+	data_end_time = time.time()
+	gc_start_time = time.time()
 	gc.collect()
+	gc_end_time = time.time()
 
 	start_wait = time.time()
 	stats['mean_loss'].block_until_ready()
@@ -164,6 +193,11 @@ for i, batch in enumerate(dataset):
 
 	if wait_time < .01:
 		print("[Warn] Training is outpacing data loading!")
+		print(f"  Data loading time: {data_end_time - data_start_time:.2f} seconds")
+		print(f"  GC time: {gc_end_time - gc_start_time:.2f} seconds")
+		print(f"  Wait time: {wait_time:.2f} seconds")
+		print(f"  Schedule time: {schedule_end_time - schedule_start_time:.2f} seconds")
+		print(f"  Training time: {train_time:.2f} seconds")
 
 	# Run test every 100 iterations
 	test_stats = None
@@ -201,5 +235,5 @@ for i, batch in enumerate(dataset):
 if model_path is not None:
 	training_utils.save_model(state, model_path)
 
-wandb.finish()
+logging_utils.finish_logging()
 print("Done!")
