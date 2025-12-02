@@ -31,12 +31,13 @@ def make_optimizer(lr: float, warmup: float, model: nnx.Module, dtype=jnp.float3
 	opt = OptimizerConfig(model)
 
 	layer_lr = lr*jax.lax.rsqrt(model.num_layers)
+	vocab_lr = lr*jax.lax.rsqrt(model.vocab_size)
 
 	# Norm optimizer
 	norm = optax.lion(learning_rate=0.0625 * layer_lr, b1=.95, b2=.95, weight_decay=1e-2, mu_dtype=dtype)
 
 	# lm_head optimizer
-	lm_head = optax.adamw(learning_rate=0.5 * lr, b1=.95, b2=.999, weight_decay=1e-3, mu_dtype=dtype)
+	lm_head = optax.adamw(learning_rate=100 * vocab_lr, b1=.95, b2=.999, weight_decay=1e-3, mu_dtype=dtype)
 
 	default = optax.adamw(learning_rate=0.5 * lr, b1=.95, b2=.999, weight_decay=1e-3, mu_dtype=dtype)
 
