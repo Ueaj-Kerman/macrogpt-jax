@@ -5,19 +5,7 @@ from typing import Sequence, Callable, Literal, Optional
 from optax import GradientTransformation
 
 from ueaj.opt.canonicalize import *
-
-
-def cast_to(dtype: jnp.dtype | None) -> GradientTransformation:
-	return optax.stateless(
-		lambda updates, params: jax.tree.map(
-			lambda u, p: u.astype(dtype if dtype is not None else p.dtype),
-			updates,
-			params
-		)
-	)
-
-def lerp(a, b, alpha):
-	return a + alpha * (b - a)
+from ueaj.opt.opt_utils import cast_to, scale_by_muonP
 
 def leading_multiply(array, target):
 	return array.reshape((-1,) + (1,) * (len(target.shape) - 1)) * target
@@ -78,22 +66,6 @@ def multiscale_momentum(
 		return update, state
 
 	return GradientTransformation(init_fn, update_fn)
-
-
-def scale_by_muonP(base_lr: float):
-	"""
-	Scale lr by muP, assumes
-	:param base_lr:
-	:param wd:
-	:return:
-	"""
-	return optax.stateless(
-		lambda updates, params: jax.tree.map(
-			lambda u, p: -max(u.shape[-1] / u.shape[-2], 1) * base_lr * u,
-			updates,
-			params
-		)
-	)
 
 
 # -3 (base)

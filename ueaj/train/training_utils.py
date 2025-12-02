@@ -183,11 +183,6 @@ def train_step(
 																								params)
 		new_params = optax.apply_updates(params, dmodel_updates)
 
-		# Rescale embeddings
-		embed_scale = jnp.sqrt(jnp.mean(jnp.square(params.embed_tokens.embedding.value), axis=1))
-		embed_scale = jnp.where(embed_scale > 1.25, embed_scale, 1.)  # reset magnitude if too high
-		new_params.embed_tokens.embedding.value = new_params.embed_tokens.embedding.value / embed_scale[:, None]
-
 		delta = jax.tree.map(lambda p, up: p.astype(jnp.float32) - up, params, new_params)
 		params = new_params
 

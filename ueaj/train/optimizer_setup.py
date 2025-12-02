@@ -10,6 +10,7 @@ from flax import nnx
 
 import ueaj.opt.multiscale as ms
 from ueaj.opt import OptimizerConfig
+from ueaj.opt.opt_utils import project_rms_rows
 from ueaj.utils.configurator import config
 
 
@@ -39,9 +40,11 @@ def make_optimizer(lr: float, warmup: float, model: nnx.Module, dtype=jnp.float3
 
 	default = optax.adamw(learning_rate=0.5 * lr, b1=.95, b2=.999, weight_decay=1e-3, mu_dtype=dtype)
 
-	# Embed optimizer (no weight decay)
-	# todo clipping optimizer
-	embed = optax.adam(learning_rate=4*layer_lr, b1=.95, b2=.999, mu_dtype=dtype)
+	# Embed optimizer (no weight decay, with RMS projection to prevent unbounded growth)
+	embed = optax.chain(
+		optax.adam(learning_rate=4*layer_lr, b1=.95, b2=.999, mu_dtype=dtype),
+		project_rms_rows(max_rms=1.25),
+	)
 
 	# Select optimizer with env_var
 	opt_name = get_optimizer_name()
