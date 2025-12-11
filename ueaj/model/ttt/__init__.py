@@ -5,6 +5,6 @@ during inference using gradient descent on a self-supervised objective.
 """
 
 from .module import TTTModel
-from .impl import ttt, make_scan_fn, make_reverse_fn
+from .impl import ttt, make_scan_fn, make_update_fn
 
-__all__ = ['TTTModel', 'ttt', 'make_scan_fn', 'make_reverse_fn']
+__all__ = ['TTTModel', 'ttt', 'make_scan_fn', 'make_update_fn']
