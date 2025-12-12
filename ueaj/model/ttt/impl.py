@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import functools as fn
 
 
-def make_update_fn(fwd_fn, n_iters=1, wd=.1, lr=.01):
+def make_update_fn(fwd_fn, n_iters=1, wd=.1, lr=.005):
 	"""Create the state update function (gradient descent on reconstruction loss)."""
 	def update_fn(state, k, v):
 		for _ in range(n_iters):
@@ -13,12 +13,13 @@ def make_update_fn(fwd_fn, n_iters=1, wd=.1, lr=.01):
 			dv = v - v_pred
 			dstate, = dstate_fn(dv)
 			# SGD with weight decay and tanh gradient clipping
+			jax.tree.map_with_path(lambda k, v: print(f"{k}: {v.dtype}"), dstate)
 			state = jax.tree.map(lambda a, b: (1-wd*lr)*a + lr*jax.nn.tanh(b), state, dstate)
 		return state
 	return update_fn
 
 
-def make_scan_fn(fwd_fn, n_iters=1, wd=.1, lr=.01):
+def make_scan_fn(fwd_fn, n_iters=1, wd=.1, lr=.005):
 	"""Create scan function: update state first, then query."""
 	update_fn = make_update_fn(fwd_fn, n_iters, wd, lr)
 
@@ -33,6 +34,103 @@ def make_scan_fn(fwd_fn, n_iters=1, wd=.1, lr=.01):
 	return scan_fn
 
 
+def make_ttt_bwd(fwd_fn, update_fn):
+	"""Create the backward pass function for TTT.
+
+	This is extracted as a separate function to allow reuse in blockwise mode.
+
+	Args:
+		fwd_fn: Forward function (state, x) -> output
+		update_fn: State update function (state, k, v) -> new_state
+
+	The backward receives (do, d_final_state) as a tuple (matching forward's output)
+	and returns (dk, dv, dq, d_init_state).
+	d_final_state allows gradient flow from subsequent blocks in blockwise mode.
+	"""
+	def _ttt_bwd(res, g):
+		do, d_final_state = g  # Unpack cotangent tuple
+		k_seq, v_seq, q_seq, init_state, final_state = res
+		do_seq = do.swapaxes(0, 1)
+
+		native_dtype = jax.tree.leaves(init_state)[0].dtype
+
+		# ==========================================
+		# PASS 1: Forward through sequence, accumulating dState sum in fp32
+		# Start with d_final_state (gradient from next block) and accumulate
+		# ==========================================
+		def pass1_scan(carry, x):
+			state, accum_dstate = carry
+			k, v, q, do = x
+
+			new_state = update_fn(state, k, v)
+			_, state_vjp_fn = jax.vjp(lambda s: fwd_fn(s, q), new_state)
+			dstate_from_query, = state_vjp_fn(do)
+
+			new_accum = jax.tree.map(
+				lambda acc, ds: acc + ds.astype(jnp.float32),
+				accum_dstate, dstate_from_query
+			)
+			return (new_state, new_accum), None
+
+		# Initialize with d_final_state (gradient flowing from next block)
+		init_accum = jax.tree.map(lambda x: x.astype(jnp.float32), d_final_state)
+		(_, total_dstate), _ = jax.lax.scan(
+			pass1_scan, (init_state, init_accum), (k_seq, v_seq, q_seq, do_seq)
+		)
+
+		# ==========================================
+		# PASS 2: Forward through sequence again, distribute gradients to k/v
+		# ==========================================
+		def pass2_scan(carry, x):
+			state, accum_dstate = carry
+			k, v, q, do = x
+
+			new_state, update_vjp_fn = jax.vjp(lambda s, k, v: update_fn(s, k, v), state, k, v)
+			accum_dstate_native = jax.tree.map(lambda x: x.astype(native_dtype), accum_dstate)
+			dstate_in, dk, dv = update_vjp_fn(accum_dstate_native)
+
+			_, state_vjp_fn = jax.vjp(lambda s: fwd_fn(s, q), new_state)
+			dstate_this, = state_vjp_fn(do)
+
+			new_accum_dstate = jax.tree.map(
+				lambda acc, ds: acc - ds.astype(jnp.float32),
+				accum_dstate, dstate_this
+			)
+
+			_, q_vjp_fn = jax.vjp(lambda q: fwd_fn(new_state, q), q)
+			dq, = q_vjp_fn(do)
+
+			return (new_state, new_accum_dstate), (dk, dv, dq)
+
+		(_, _), (dk_seq, dv_seq, dq_seq) = jax.lax.scan(
+			pass2_scan,
+			(init_state, total_dstate),
+			(k_seq, v_seq, q_seq, do_seq)
+		)
+
+		# ==========================================
+		# Compute dstate for init_state using batched computation
+		# Treat all queries and dOs as one big batch
+		# ==========================================
+		q_batched = q_seq.reshape(-1, q_seq.shape[-1])  # (seq*batch, hidden)
+		do_batched = do_seq.reshape(-1, do_seq.shape[-1])  # (seq*batch, hidden)
+
+		# Compute gradient of fwd_fn(init_state, q_batched) w.r.t. init_state
+		_, init_state_vjp_fn = jax.vjp(lambda s: fwd_fn(s, q_batched), init_state)
+		dstate_from_queries, = init_state_vjp_fn(do_batched)
+
+		# Add d_final_state contribution (backprop through state chain)
+		dstate = jax.tree.map(
+			lambda dq, dfs: dq + dfs,
+			dstate_from_queries, d_final_state
+		)
+
+		dq, dk, dv = dq_seq.swapaxes(0, 1), dk_seq.swapaxes(0, 1), dv_seq.swapaxes(0, 1)
+		return dk, dv, dq, dstate
+
+	return _ttt_bwd
+
+
 def ttt(fwd_fn, surrogate=True):
 	"""Create TTT layer with optional surrogate gradients.
 
@@ -40,9 +138,10 @@ def ttt(fwd_fn, surrogate=True):
 	1. Update state using (k, v) via gradient descent
 	2. Query updated state with q to produce output
 
-	The surrogate backward pass uses a two-pass approach:
-	Pass 1 (forward): Accumulate dState from all positions in fp32
-	Pass 2 (forward): Distribute gradients to k/v while subtracting each position's contribution
+	Returns: (output, final_state) tuple
+
+	The surrogate backward pass uses a two-pass approach for k/v gradients,
+	and a batched computation for the init_state gradient.
 	"""
 	fwd_scan = make_scan_fn(fwd_fn)
 	update_fn = make_update_fn(fwd_fn)
@@ -50,13 +149,13 @@ def ttt(fwd_fn, surrogate=True):
 	def _ttt_fwd(k: jax.Array, v: jax.Array, q: jax.Array, state):
 		k_seq, v_seq, q_seq = k.swapaxes(0, 1), v.swapaxes(0, 1), q.swapaxes(0, 1)
 
-		new_state, o_seq = jax.lax.scan(fwd_scan, state, (k_seq, v_seq, q_seq))
+		final_state, o_seq = jax.lax.scan(fwd_scan, state, (k_seq, v_seq, q_seq))
 
 		o = o_seq.swapaxes(0, 1)
 		if surrogate:
-			return o, (k_seq, v_seq, q_seq, state)
+			return (o, final_state), (k_seq, v_seq, q_seq, state, final_state)
 		else:
-			return o
+			return (o, final_state)
 
 	if not surrogate:
 		return _ttt_fwd
@@ -65,89 +164,7 @@ def ttt(fwd_fn, surrogate=True):
 	def ttt_inner(k: jax.Array, v: jax.Array, q: jax.Array, state):
 		return _ttt_fwd(k, v, q, state)[0]
 
-	def _ttt_bwd(res, do):
-		k_seq, v_seq, q_seq, init_state = res
-		do_seq = do.swapaxes(0, 1)
-
-		# Get the native dtype from the state (before tracing)
-		native_dtype = jax.tree.leaves(init_state)[0].dtype
-
-		# ==========================================
-		# PASS 1: Forward through sequence, accumulating dState sum in fp32
-		# At each position: update state, query it, backprop dO through query
-		# Only accumulate the sum - don't store individual dstates
-		# ==========================================
-		def pass1_scan(carry, x):
-			state, accum_dstate = carry
-			k, v, q, do = x
-
-			# Update state first
-			new_state = update_fn(state, k, v)
-
-			# Query the updated state and get VJP for dO -> dState
-			_, state_vjp_fn = jax.vjp(lambda s: fwd_fn(s, q), new_state)
-			dstate_from_query, = state_vjp_fn(do)
-
-			# Accumulate in fp32
-			new_accum = jax.tree.map(
-				lambda acc, ds: acc + ds.astype(jnp.float32),
-				accum_dstate, dstate_from_query
-			)
-
-			return (new_state, new_accum), None
-
-		# Initialize accumulator with zeros in fp32
-		zero_accum = jax.tree.map(lambda x: jnp.zeros_like(x, dtype=jnp.float32), init_state)
-
-		(_, total_dstate), _ = jax.lax.scan(
-			pass1_scan, (init_state, zero_accum), (k_seq, v_seq, q_seq, do_seq)
-		)
-
-		# ==========================================
-		# PASS 2: Forward through sequence again
-		# Recompute dstate_this at each step, use accumulated gradient for k/v grads,
-		# then subtract this position's contribution
-		# ==========================================
-		def pass2_scan(carry, x):
-			state, accum_dstate = carry
-			k, v, q, do = x
-
-			# Get VJP for the update step: (state, k, v) -> new_state
-			new_state, update_vjp_fn = jax.vjp(lambda s, k, v: update_fn(s, k, v), state, k, v)
-
-			# Use accumulated dstate (from all positions >= t) to get gradients
-			accum_dstate_native = jax.tree.map(lambda x: x.astype(native_dtype), accum_dstate)
-			dstate_in, dk, dv = update_vjp_fn(accum_dstate_native)
-
-			# Recompute dstate_this for this position (to subtract from accumulator)
-			_, state_vjp_fn = jax.vjp(lambda s: fwd_fn(s, q), new_state)
-			dstate_this, = state_vjp_fn(do)
-
-			# Subtract this position's contribution from the accumulator
-			new_accum_dstate = jax.tree.map(
-				lambda acc, ds: acc - ds.astype(jnp.float32),
-				accum_dstate, dstate_this
-			)
-
-			# Also need dq from the query
-			_, q_vjp_fn = jax.vjp(lambda q: fwd_fn(new_state, q), q)
-			dq, = q_vjp_fn(do)
-
-			return (new_state, new_accum_dstate), (dk, dv, dq)
-
-		(_, final_dstate), (dk_seq, dv_seq, dq_seq) = jax.lax.scan(
-			pass2_scan,
-			(init_state, total_dstate),
-			(k_seq, v_seq, q_seq, do_seq)
-		)
-
-		# final_dstate is the remaining gradient that flows to init_state
-		dstate = jax.tree.map(lambda x: x.astype(native_dtype), final_dstate)
-
-		dq, dk, dv = dq_seq.swapaxes(0, 1), dk_seq.swapaxes(0, 1), dv_seq.swapaxes(0, 1)
-		return dk, dv, dq, dstate
-
-	ttt_inner.defvjp(_ttt_fwd, _ttt_bwd)
+	ttt_inner.defvjp(_ttt_fwd, make_ttt_bwd(fwd_fn, update_fn))
 	return ttt_inner
 
 
@@ -178,13 +195,13 @@ if __name__ == "__main__":
 
 	# Test forward pass
 	print("\n1. Testing forward pass...")
-	output = ttt_layer(k, v, q, state)
-	print(f"   ✓ Forward pass successful! Output shape: {output.shape}")
+	output, final_state = ttt_layer(k, v, q, state)
+	print(f"   ✓ Forward pass successful! Output shape: {output.shape}, Final state shape: {final_state.shape}")
 
 	# Test gradient computation
 	print("\n2. Testing backward pass (gradients)...")
 	def loss_fn(k, v, q, state):
-		output = ttt_layer(k, v, q, state)
+		output, final_state = ttt_layer(k, v, q, state)
 		return jnp.sum(output ** 2)
 
 	grads = jax.grad(loss_fn, argnums=(0, 1, 2, 3))(k, v, q, state)
@@ -194,7 +211,7 @@ if __name__ == "__main__":
 	# Test JIT compilation
 	print("\n3. Testing JIT compilation...")
 	jitted_ttt = jax.jit(ttt_layer)
-	output_jit = jitted_ttt(k, v, q, state)
+	output_jit, final_state_jit = jitted_ttt(k, v, q, state)
 	print(f"   ✓ JIT compilation successful!")
 	print(f"   Outputs match: {jnp.allclose(output, output_jit)}")
 

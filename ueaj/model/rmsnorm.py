@@ -29,9 +29,9 @@ class RMSNorm(nnx.Module):
 	):
 		super().__init__()
 		self.eps = eps
-		self.scale = None
 		self.recenter = False
 		self.sharding = sharding
+		self.has_scale = scale_mode != 'none'
 
 		if scale_mode == 'none':
 			return
@@ -76,7 +76,7 @@ class RMSNorm(nnx.Module):
 		x = x * jax.lax.rsqrt(var + self.eps)
 		
 		# Apply scale if present
-		if self.scale is not None:
+		if self.has_scale:
 			x, scale = promote_fp8(x, self.scale.value)
 			if self.recenter:
 				x = x * (1 + scale)
@@ -87,11 +87,11 @@ class RMSNorm(nnx.Module):
 	
 	def reshard(self, mesh: jax.sharding.Mesh) -> None:
 		"""Reshard the scale parameter on the given mesh.
-		
+
 		Args:
 			mesh: JAX mesh to shard on
 		"""
-		if self.scale is None:
+		if not self.has_scale:
 			# No scale parameter to reshard (scale_mode='none')
 			return
 		

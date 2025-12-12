@@ -7,6 +7,7 @@ from flax.nnx import rnglib as rng
 
 from ueaj.model import GMLP
 from ueaj.model.einsum import Einsum, lecun_normal_init, zeros_init
+from ueaj.model.rmsnorm import RMSNorm
 from ueaj.utils.configurator import config
 from .impl import ttt
 
@@ -74,6 +75,9 @@ class TTTModel(nnx.Module):
 			**module_kwargs
 		)
 
+		# RMSNorm after TTT, before output projection
+		self.norm = RMSNorm(hidden_d, rngs=rngs, mesh=mesh)
+
 		# Output projection to map from hidden_d back to model_d
 		size_dict_out = {'d': model_d, 'h': hidden_d}
 		self.out_proj = Einsum(
@@ -123,12 +127,18 @@ class TTTModel(nnx.Module):
 		# Project input to k, v, q
 		k, v, q = self.kvq_proj(x)  # Each: (batch, seq_len, hidden_d)
 
-		# Apply TTT algorithm
-		hidden = self.ttt_fn(k, v, q, nnx.state(self.inner_module))
+		# Apply TTT algorithm - returns (output, final_state)
+		hidden, final_state = self.ttt_fn(k, v, q, nnx.state(self.inner_module))
 
-		# Project back to model dimension
+		# Normalize and project back to model dimension
+		hidden = self.norm(hidden)
 		output = self.out_proj(hidden)
 		return output
 
 	def apply_ttt(self, k, v, q):
+		"""Apply TTT algorithm directly on k, v, q.
+
+		Returns:
+			(hidden_output, final_state) tuple
+		"""
 		return self.ttt_fn(k, v, q, nnx.state(self.inner_module))
