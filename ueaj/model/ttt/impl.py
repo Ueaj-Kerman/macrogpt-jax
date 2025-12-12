@@ -13,7 +13,7 @@ def make_update_fn(fwd_fn, n_iters=1, wd=.1, lr=.005):
 			dv = v - v_pred
 			dstate, = dstate_fn(dv)
 			# SGD with weight decay and tanh gradient clipping
-			jax.tree.map_with_path(lambda k, v: print(f"{k}: {v.dtype}"), dstate)
+			# jax.tree.map_with_path(lambda k, v: print(f"{k}: {v.dtype}"), dstate)
 			state = jax.tree.map(lambda a, b: (1-wd*lr)*a + lr*jax.nn.tanh(b), state, dstate)
 		return state
 	return update_fn
