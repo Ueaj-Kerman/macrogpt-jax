@@ -109,20 +109,25 @@ def make_ttt_bwd(fwd_fn, update_fn):
 		)
 
 		# ==========================================
-		# Compute dstate for init_state using batched computation
-		# Treat all queries and dOs as one big batch
+		# Compute dstate using batched update VJP
 		# ==========================================
+		k_batched = k_seq.reshape(-1, k_seq.shape[-1])  # (seq*batch, hidden)
+		v_batched = v_seq.reshape(-1, v_seq.shape[-1])  # (seq*batch, hidden)
 		q_batched = q_seq.reshape(-1, q_seq.shape[-1])  # (seq*batch, hidden)
 		do_batched = do_seq.reshape(-1, do_seq.shape[-1])  # (seq*batch, hidden)
 
-		# Compute gradient of fwd_fn(init_state, q_batched) w.r.t. init_state
-		_, init_state_vjp_fn = jax.vjp(lambda s: fwd_fn(s, q_batched), init_state)
-		dstate_from_queries, = init_state_vjp_fn(do_batched)
+		# Translate d_final_state to d_init_state via batched update VJP
+		_, update_vjp_fn = jax.vjp(lambda s: update_fn(s, k_batched, v_batched), init_state)
+		dstate_from_final, = update_vjp_fn(d_final_state)
 
-		# Add d_final_state contribution (backprop through state chain)
+		# Gradient from queries via batched fwd VJP
+		_, fwd_vjp_fn = jax.vjp(lambda s: fwd_fn(s, q_batched), init_state)
+		dstate_from_queries, = fwd_vjp_fn(do_batched)
+
+		# Combine both contributions
 		dstate = jax.tree.map(
-			lambda dq, dfs: dq + dfs,
-			dstate_from_queries, d_final_state
+			lambda dq, df: dq + df,
+			dstate_from_queries, dstate_from_final
 		)
 
 		dq, dk, dv = dq_seq.swapaxes(0, 1), dk_seq.swapaxes(0, 1), dv_seq.swapaxes(0, 1)

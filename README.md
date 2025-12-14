@@ -2,6 +2,27 @@
 
 A very opinionated distributed pretraining framework built on JAX/Flax, designed for OOD/creative research. 
 
+## Branch Information
+This branch implements a new surrogate gradient method for test time training. 
+It can be found in `~/ueaj/model/ttt/impl.py`. The way it works is by accumulating the state deltas across the sequence
+in one forward pass, and then doing a second forward pass, subtracting the recomputed local delta from the overall sum.
+This is an approximation and has tradeoffs.
+
+### Tradeoff
+The fundamental tradeoff of the new method is that it does not teach the network multi-step composition.
+In other words it does not learn to, given future changes to the state, how to adjust the current state to meet a future target state.
+It does however learn single degree composition, that is, given a future state, and it's target how can I change my current state to get closer?
+The transformer on the other hand, can do neither.
+
+### TODO
+ - [ ] Local blockwise pure backprop
+   - During the first forward in the bwd pass, do true backprop to get the state delta for each *block*
+   - For hidden dimension 768 the hidden state consumes 28,311,552 bytes. 
+     - Targeting a total checkpointing volume of 1GB allows us to make 37 total checkpoints.
+     - A block size of 32 is a good target
+   - For a hidden dimension of 512 the hidden state consumes 12,582,912 bytes.
+     - A block size of 64 is a good target
+ - [ ] Integration with pararnn (double bloccy!! (I'm killing myself))
 ## Key Features
 
 - **Highly Configurable**: Hierarchical configuration system using `@config` decorator for flexible model composition
