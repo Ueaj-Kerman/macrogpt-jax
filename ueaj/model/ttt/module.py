@@ -27,6 +27,10 @@ class TTTModel(nnx.Module):
 		module_kwargs: Additional kwargs to pass to the inner module
 		param_dtype: Parameter dtype
 		surrogate: Whether to use surrogate gradients (custom VJP) for backprop
+		n_iters: Number of gradient descent iterations per token
+		wd: Weight decay coefficient for state updates
+		lr: Learning rate for state updates
+		block_size: If set, process tokens in blocks of this size (reduces memory)
 		rngs: Random number generators
 		mesh: Optional JAX mesh for distributed training
 	"""
@@ -38,6 +42,10 @@ class TTTModel(nnx.Module):
 		module_kwargs: dict | None = None,
 		param_dtype: jnp.dtype = jnp.bfloat16,
 		surrogate: bool = True,
+		n_iters: int = 1,
+		wd: float = 0.1,
+		lr: float = 0.005,
+		block_size: int | None = None,
 		*,
 		rngs: rng.Rngs,
 		mesh: Optional[jax.sharding.Mesh] = None
@@ -72,6 +80,7 @@ class TTTModel(nnx.Module):
 			model_d=hidden_d,
 			rngs=rngs,
 			mesh=mesh,
+			param_dtype=param_dtype,
 			**module_kwargs
 		)
 
@@ -91,7 +100,14 @@ class TTTModel(nnx.Module):
 		)
 
 		# Create the TTT forward function
-		self.ttt_fn = ttt(self._fwd_fn, surrogate=surrogate)
+		self.ttt_fn = ttt(
+			self._fwd_fn,
+			surrogate=surrogate,
+			n_iters=n_iters,
+			wd=wd,
+			lr=lr,
+			block_size=block_size
+		)
 		self.inner_module_gdef = nnx.graphdef(self.inner_module)
 
 	def _fwd_fn(self, module_state: nnx.State, x: jax.Array) -> jax.Array:

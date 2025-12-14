@@ -49,6 +49,7 @@ def ttt(fwd_fn, surrogate=True, n_iters=1, wd=.1, lr=.005, block_size=None):
 	"""
 	fwd_scan = make_scan_fn(fwd_fn, n_iters, wd, lr)
 	update_fn = make_update_fn(fwd_fn, n_iters, wd, lr)
+	update_fn_ref = update_fn
 
 	reshape = lambda v: v
 	unshape = lambda v: v
@@ -65,8 +66,12 @@ def ttt(fwd_fn, surrogate=True, n_iters=1, wd=.1, lr=.005, block_size=None):
 		reshape = lambda v: jax.tree.map(reshape_fn, v)
 		unshape = lambda v: jax.tree.map(unshape_fn, v)
 
-		fwd_scan = functools.partial(jax.lax.scan, f=fwd_scan)
-		update_fn = functools.partial(jax.lax.scan, f=update_fn)
+		# fwd_fn = jax.vmap(fwd_fn, in_axes=(None, 0))
+		fwd_scan = functools.partial(jax.lax.scan, fwd_scan)
+
+		def update_wrapped(state, k, v):
+			return jax.lax.scan(lambda state, kv: (update_fn_ref(state, *kv), None), state, (k, v))[0]
+		update_fn = update_wrapped
 
 		if not surrogate:
 			fwd_scan = jax.remat(fwd_scan, policy=jax.checkpoint_policies.nothing_saveable)
@@ -94,23 +99,22 @@ def ttt(fwd_fn, surrogate=True, n_iters=1, wd=.1, lr=.005, block_size=None):
 		# Start with d_final_state (gradient from next block) and accumulate
 		# ==========================================
 		def pass1_scan(carry, x):
-			state, accum_dstate = carry
+			state, dstate_accum = carry
 			k, v, q, do = x
 
-			new_state = update_fn(state, k, v)
-			_, state_vjp_fn = jax.vjp(lambda s: fwd_fn(s, q), new_state)
-			dstate_from_query, = state_vjp_fn(do)
+			_, state_vjp_fn, state = jax.vjp(lambda s: tuple(reversed(fwd_scan(s, (k, v, q)))), state, has_aux=True)
+			dstate, = state_vjp_fn(do)
 
-			new_accum = jax.tree.map(
-				lambda acc, ds: acc + ds.astype(jnp.float32),
-				accum_dstate, dstate_from_query
+			dstate_accum = jax.tree.map(
+				lambda acc, ds: acc + ds,
+				dstate_accum, dstate
 			)
-			return (new_state, new_accum), None
+			return (state, dstate_accum), None
 
 		# Initialize with d_final_state (gradient flowing from next block)
 		init_accum = jax.tree.map(lambda x: x.astype(jnp.float32), d_final_state)
 		(_, total_dstate), _ = jax.lax.scan(
-			pass1_scan, (init_state, init_accum), (k, v, q, do)
+			pass1_scan, (init_state, init_accum), reshape((k, v, q, do))
 		)
 
 		# ==========================================
@@ -124,29 +128,28 @@ def ttt(fwd_fn, surrogate=True, n_iters=1, wd=.1, lr=.005, block_size=None):
 			accum_dstate_native = jax.tree.map(lambda x: x.astype(native_dtype), accum_dstate)
 			dstate_in, dk, dv = update_vjp_fn(accum_dstate_native)
 
-			_, state_vjp_fn = jax.vjp(lambda s: fwd_fn(s, q), new_state)
-			dstate_this, = state_vjp_fn(do)
+			_, state_vjp_fn = jax.vjp(lambda s, q: fwd_scan(s, (k, v, q))[1], state, q)
+			dstate_this, dq = state_vjp_fn(do)
 
 			new_accum_dstate = jax.tree.map(
 				lambda acc, ds: acc - ds.astype(jnp.float32),
 				accum_dstate, dstate_this
 			)
 
-			_, q_vjp_fn = jax.vjp(lambda q: fwd_fn(new_state, q), q)
-			dq, = q_vjp_fn(do)
-
 			return (new_state, new_accum_dstate), (dk, dv, dq)
 
 		(_, _), (dk, dv, dq) = jax.lax.scan(
 			pass2_scan,
 			(init_state, total_dstate),
-			(k, v, q, do)
+			reshape((k, v, q, do))
 		)
 
-		# Translate d_final_state to d_init_state via batched update VJP
+		dk, dv, dq = unshape((dk, dv, dq))
+
+		# # Translate d_final_state to d_init_state via batched update VJP
 		@jax.jit
 		def batch_update(state):
-			states = jax.vmap(update_fn, in_axes=(None, 0, 0), out_axes=0)(state, k, v)
+			states = jax.vmap(update_fn_ref, in_axes=(None, 0, 0), out_axes=0)(state, k, v)
 			return jax.tree.map(lambda v: v.sum(axis=0), states)
 
 		_, update_vjp_fn = jax.vjp(batch_update, init_state)
@@ -156,11 +159,12 @@ def ttt(fwd_fn, surrogate=True, n_iters=1, wd=.1, lr=.005, block_size=None):
 		_, fwd_vjp_fn = jax.vjp(lambda s: jax.vmap(fwd_fn, in_axes=(None, 0))(s, q), init_state)
 		dstate_from_queries, = fwd_vjp_fn(do)
 
-		# Combine both contributions
+		# # Combine both contributions
 		dstate = jax.tree.map(
 			lambda dq, df: dq + df,
 			dstate_from_queries, dstate_from_final
 		)
+		# dstate = d_final_state
 
 		return dk, dv, dq, dstate
 
