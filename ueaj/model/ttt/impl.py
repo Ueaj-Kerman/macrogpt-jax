@@ -1,12 +1,12 @@
-from typing import Sequence
+import functools
 
 import jax
 import jax.numpy as jnp
-import functools as fn
 
 
-def make_update_fn(fwd_fn, n_iters=1, wd=.1, lr=.005):
+def make_update_fn(fwd_fn, n_iters, wd, lr):
 	"""Create the state update function (gradient descent on reconstruction loss)."""
+
 	def update_fn(state, k, v):
 		for _ in range(n_iters):
 			v_pred, dstate_fn = jax.vjp(lambda state: fwd_fn(state, k), state)
@@ -14,12 +14,13 @@ def make_update_fn(fwd_fn, n_iters=1, wd=.1, lr=.005):
 			dstate, = dstate_fn(dv)
 			# SGD with weight decay and tanh gradient clipping
 			# jax.tree.map_with_path(lambda k, v: print(f"{k}: {v.dtype}"), dstate)
-			state = jax.tree.map(lambda a, b: (1-wd*lr)*a + lr*jax.nn.tanh(b), state, dstate)
+			state = jax.tree.map(lambda a, b: (1 - wd * lr) * a + lr * jax.nn.tanh(b), state, dstate)
 		return state
+
 	return update_fn
 
 
-def make_scan_fn(fwd_fn, n_iters=1, wd=.1, lr=.005):
+def make_scan_fn(fwd_fn, n_iters, wd, lr):
 	"""Create scan function: update state first, then query."""
 	update_fn = make_update_fn(fwd_fn, n_iters, wd, lr)
 
@@ -34,23 +35,57 @@ def make_scan_fn(fwd_fn, n_iters=1, wd=.1, lr=.005):
 	return scan_fn
 
 
-def make_ttt_bwd(fwd_fn, update_fn):
-	"""Create the backward pass function for TTT.
+def ttt(fwd_fn, surrogate=True, n_iters=1, wd=.1, lr=.005, block_size=None):
+	"""Create TTT layer with optional surrogate gradients.
 
-	This is extracted as a separate function to allow reuse in blockwise mode.
+	The forward pass:
+	1. Update state using (k, v) via gradient descent
+	2. Query updated state with q to produce output
 
-	Args:
-		fwd_fn: Forward function (state, x) -> output
-		update_fn: State update function (state, k, v) -> new_state
+	Returns: (output, final_state) tuple
 
-	The backward receives (do, d_final_state) as a tuple (matching forward's output)
-	and returns (dk, dv, dq, d_init_state).
-	d_final_state allows gradient flow from subsequent blocks in blockwise mode.
+	The surrogate backward pass uses a two-pass approach for k/v gradients,
+	and a batched computation for the init_state gradient.
 	"""
+	fwd_scan = make_scan_fn(fwd_fn, n_iters, wd, lr)
+	update_fn = make_update_fn(fwd_fn, n_iters, wd, lr)
+
+	reshape = lambda v: v
+	unshape = lambda v: v
+	if block_size is not None:
+		assert block_size > 0, "block_size must be positive"
+
+		def reshape_fn(v):
+			assert v.shape[0] % block_size == 0, f"seq len ({v.shape[0]}) must be a multiple of block_size ({block_size})"
+			return v.reshape((v.shape[0] // block_size, block_size) + v.shape[1:])
+		def unshape_fn(v):
+			assert v.shape[1] == block_size, f"tensor block size ({block_size}) must be equal to block size ({block_size})"
+			return v.reshape((v.shape[0]*block_size,) + v.shape[2:])
+
+		reshape = lambda v: jax.tree.map(reshape_fn, v)
+		unshape = lambda v: jax.tree.map(unshape_fn, v)
+
+		fwd_scan = functools.partial(jax.lax.scan, f=fwd_scan)
+		update_fn = functools.partial(jax.lax.scan, f=update_fn)
+
+		if not surrogate:
+			fwd_scan = jax.remat(fwd_scan, policy=jax.checkpoint_policies.nothing_saveable)
+
+	def _ttt_fwd(k: jax.Array, v: jax.Array, q: jax.Array, state):
+		final_state, o = jax.lax.scan(fwd_scan, state, reshape((k, v, q)))
+		o = unshape(o)
+
+		return (o, final_state), (k, v, q, state, final_state)
+
+	def _ttt(k: jax.Array, v: jax.Array, q: jax.Array, state):
+		return _ttt_fwd(k, v, q, state)[0]
+
+	if not surrogate:
+		return jax.vmap(_ttt, in_axes=(0, 0, 0, None))
+
 	def _ttt_bwd(res, g):
 		do, d_final_state = g  # Unpack cotangent tuple
-		k_seq, v_seq, q_seq, init_state, final_state = res
-		do_seq = do.swapaxes(0, 1)
+		k, v, q, init_state, final_state = res
 
 		native_dtype = jax.tree.leaves(init_state)[0].dtype
 
@@ -75,7 +110,7 @@ def make_ttt_bwd(fwd_fn, update_fn):
 		# Initialize with d_final_state (gradient flowing from next block)
 		init_accum = jax.tree.map(lambda x: x.astype(jnp.float32), d_final_state)
 		(_, total_dstate), _ = jax.lax.scan(
-			pass1_scan, (init_state, init_accum), (k_seq, v_seq, q_seq, do_seq)
+			pass1_scan, (init_state, init_accum), (k, v, q, do)
 		)
 
 		# ==========================================
@@ -102,27 +137,24 @@ def make_ttt_bwd(fwd_fn, update_fn):
 
 			return (new_state, new_accum_dstate), (dk, dv, dq)
 
-		(_, _), (dk_seq, dv_seq, dq_seq) = jax.lax.scan(
+		(_, _), (dk, dv, dq) = jax.lax.scan(
 			pass2_scan,
 			(init_state, total_dstate),
-			(k_seq, v_seq, q_seq, do_seq)
+			(k, v, q, do)
 		)
 
-		# ==========================================
-		# Compute dstate using batched update VJP
-		# ==========================================
-		k_batched = k_seq.reshape(-1, k_seq.shape[-1])  # (seq*batch, hidden)
-		v_batched = v_seq.reshape(-1, v_seq.shape[-1])  # (seq*batch, hidden)
-		q_batched = q_seq.reshape(-1, q_seq.shape[-1])  # (seq*batch, hidden)
-		do_batched = do_seq.reshape(-1, do_seq.shape[-1])  # (seq*batch, hidden)
-
 		# Translate d_final_state to d_init_state via batched update VJP
-		_, update_vjp_fn = jax.vjp(lambda s: update_fn(s, k_batched, v_batched), init_state)
+		@jax.jit
+		def batch_update(state):
+			states = jax.vmap(update_fn, in_axes=(None, 0, 0), out_axes=0)(state, k, v)
+			return jax.tree.map(lambda v: v.sum(axis=0), states)
+
+		_, update_vjp_fn = jax.vjp(batch_update, init_state)
 		dstate_from_final, = update_vjp_fn(d_final_state)
 
 		# Gradient from queries via batched fwd VJP
-		_, fwd_vjp_fn = jax.vjp(lambda s: fwd_fn(s, q_batched), init_state)
-		dstate_from_queries, = fwd_vjp_fn(do_batched)
+		_, fwd_vjp_fn = jax.vjp(lambda s: jax.vmap(fwd_fn, in_axes=(None, 0))(s, q), init_state)
+		dstate_from_queries, = fwd_vjp_fn(do)
 
 		# Combine both contributions
 		dstate = jax.tree.map(
@@ -130,56 +162,23 @@ def make_ttt_bwd(fwd_fn, update_fn):
 			dstate_from_queries, dstate_from_final
 		)
 
-		dq, dk, dv = dq_seq.swapaxes(0, 1), dk_seq.swapaxes(0, 1), dv_seq.swapaxes(0, 1)
 		return dk, dv, dq, dstate
 
-	return _ttt_bwd
+	_ttt = jax.custom_vjp(_ttt)
+	_ttt.defvjp(_ttt_fwd, _ttt_bwd)
 
-
-def ttt(fwd_fn, surrogate=True):
-	"""Create TTT layer with optional surrogate gradients.
-
-	The forward pass:
-	1. Update state using (k, v) via gradient descent
-	2. Query updated state with q to produce output
-
-	Returns: (output, final_state) tuple
-
-	The surrogate backward pass uses a two-pass approach for k/v gradients,
-	and a batched computation for the init_state gradient.
-	"""
-	fwd_scan = make_scan_fn(fwd_fn)
-	update_fn = make_update_fn(fwd_fn)
-
-	def _ttt_fwd(k: jax.Array, v: jax.Array, q: jax.Array, state):
-		k_seq, v_seq, q_seq = k.swapaxes(0, 1), v.swapaxes(0, 1), q.swapaxes(0, 1)
-
-		final_state, o_seq = jax.lax.scan(fwd_scan, state, (k_seq, v_seq, q_seq))
-
-		o = o_seq.swapaxes(0, 1)
-		if surrogate:
-			return (o, final_state), (k_seq, v_seq, q_seq, state, final_state)
-		else:
-			return (o, final_state)
-
-	if not surrogate:
-		return _ttt_fwd
-
-	@jax.custom_vjp
-	def ttt_inner(k: jax.Array, v: jax.Array, q: jax.Array, state):
-		return _ttt_fwd(k, v, q, state)[0]
-
-	ttt_inner.defvjp(_ttt_fwd, make_ttt_bwd(fwd_fn, update_fn))
-	return ttt_inner
+	return jax.vmap(_ttt, in_axes=(0, 0, 0, None))
 
 
 if __name__ == "__main__":
 	print("Testing TTT implementation...")
 
+
 	# Define a simple forward function: output = q @ state
 	def simple_fwd_fn(state, q):
 		"""Simple linear transformation: state is a matrix, q has shape (batch, d_model)"""
 		return q @ state
+
 
 	# Create test inputs
 	batch_size, seq_len, d_model = 2, 4, 8
@@ -205,9 +204,12 @@ if __name__ == "__main__":
 
 	# Test gradient computation
 	print("\n2. Testing backward pass (gradients)...")
+
+
 	def loss_fn(k, v, q, state):
 		output, final_state = ttt_layer(k, v, q, state)
 		return jnp.sum(output ** 2)
+
 
 	grads = jax.grad(loss_fn, argnums=(0, 1, 2, 3))(k, v, q, state)
 	print(f"   ✓ Backward pass successful!")
@@ -230,12 +232,13 @@ if __name__ == "__main__":
 	print("\n✅ All tests passed! TTT implementation is valid.")
 
 	# Test TTTModel integration
-	print("\n" + "="*50)
+	print("\n" + "=" * 50)
 	print("Testing TTTModel integration...")
-	print("="*50)
+	print("=" * 50)
 
 	import sys
 	import os
+
 	sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 
 	from ueaj.model.ttt.module import TTTModel
@@ -266,9 +269,12 @@ if __name__ == "__main__":
 
 	# Test gradient computation
 	print("\n6. Testing TTTModel gradients...")
+
+
 	def model_loss_fn(x):
 		output = model(x)
 		return jnp.sum(output ** 2)
+
 
 	grads = jax.grad(model_loss_fn)(x)
 	print(f"   ✓ Backward pass successful! Gradient shape: {grads.shape}")

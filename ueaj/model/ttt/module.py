@@ -109,10 +109,9 @@ class TTTModel(nnx.Module):
 
 		# Apply inner module
 		# Add dummy sequence dimension since modules expect (batch, seq, d)
-		x = x[:, None, :]  # (batch, 1, hidden_d)
+		x = x[None, None, ...]  # (batch, 1, hidden_d)
 		x = module(x)
-		x = x[:, 0, :]  # Remove sequence dimension -> (batch, hidden_d)
-
+		x = x[0, 0]  # Remove sequence dimension -> (batch, hidden_d)
 		return x
 
 	def __call__(self, x: jax.Array) -> jax.Array:
