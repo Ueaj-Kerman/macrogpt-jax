@@ -3,7 +3,7 @@
 import jax
 import numpy as np
 from typing import Callable, Optional, Iterator, Tuple, Any, Generator
-from . import pack_documents, batch_iterator, device_prefetch, tuple_collate
+from . import pack_documents, padding_iterator, batch_iterator, device_prefetch, tuple_collate
 
 
 def create_tokenize_fn(tokenizer, column: str = "text") -> Callable:
@@ -42,11 +42,13 @@ def prepare_dataset(
     seq_len: int,
     pad_token_id: int,
     column: str = "text",
+    use_packing: bool = True,
     min_fill_ratio: float = 0.99,
+    truncate: bool = True,
     buffer_size: int = 10
 ) -> Tuple[Generator[Tuple[jax.Array, jax.Array], None, None], Tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct]]:
     """Prepare a streaming dataset for training.
-    
+
     Args:
         dataset: Streaming dataset from datasets.load_dataset()
         tokenizer: Tokenizer to use
@@ -54,9 +56,13 @@ def prepare_dataset(
         seq_len: Sequence length for training
         pad_token_id: Token ID to use for padding
         column: Column name to tokenize (default: "text")
-        min_fill_ratio: Minimum fill ratio for document packing
+        use_packing: If True, pack multiple documents per sequence for efficiency.
+                     If False, each sequence is one document with padding.
+        min_fill_ratio: Minimum fill ratio for document packing (only used if use_packing=True)
+        truncate: If False and use_packing=False, split long sequences into chunks
+                  instead of truncating (only used if use_packing=False)
         buffer_size: Buffer size for device prefetching
-        
+
     Returns:
         Tuple of:
         - Iterator yielding (tokens, document_ids) batches
@@ -66,15 +72,20 @@ def prepare_dataset(
     tokenize_fn = create_tokenize_fn(tokenizer, column)
     dataset = dataset.map(tokenize_fn, batched=True)
     dataset = dataset.select_columns("tokens")
-    
+
     # Create iterator pipeline
     dataset = tokens_iterator(dataset)
-    dataset = pack_documents(dataset, max_length=seq_len, min_fill_ratio=min_fill_ratio, pad_token_id=pad_token_id)
+
+    if use_packing:
+        dataset = pack_documents(dataset, max_length=seq_len, min_fill_ratio=min_fill_ratio, pad_token_id=pad_token_id)
+    else:
+        dataset = padding_iterator(dataset, max_length=seq_len, pad_token_id=pad_token_id, truncate=truncate)
+
     dataset = batch_iterator(dataset, batch_size=batch_size, drop_last=True, collate_fn=tuple_collate)
     dataset = device_prefetch(dataset, buffer_size=buffer_size)
-    
+
     # Create structure descriptors for compilation
     tokens_struct = jax.ShapeDtypeStruct((batch_size, seq_len), jax.numpy.int32)
     document_ids_struct = jax.ShapeDtypeStruct((batch_size, seq_len), jax.numpy.int32)
-    
+
     return dataset, (tokens_struct, document_ids_struct)

@@ -1,10 +1,69 @@
-"""Document packing utilities for efficient sequence batching using power-of-2 bucketing."""
+"""Document packing and padding utilities for sequence batching."""
 
 import math
 from typing import Iterator, Optional, Union, List, Dict, Tuple
 from collections import defaultdict
 import numpy as np
 import jax.numpy as jnp
+
+
+def padding_iterator(
+    token_iterator: Iterator[Union[np.ndarray, jnp.ndarray, List[int]]],
+    max_length: int,
+    pad_token_id: int = 0,
+    truncate: bool = True
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Pad/truncate individual sequences to fixed length without packing.
+
+    Each sequence becomes its own batch element, padded or truncated to max_length.
+    Document IDs are 1 for actual tokens and 0 for padding (matching pack_documents format).
+
+    Args:
+        token_iterator: Iterator yielding token sequences
+        max_length: Target sequence length (pad shorter, optionally truncate longer)
+        pad_token_id: Token ID to use for padding
+        truncate: If True, truncate sequences longer than max_length.
+                  If False, split long sequences into multiple chunks.
+
+    Yields:
+        Tuples of (tokens, document_ids) where:
+        - tokens: np.ndarray of shape (max_length,) with token IDs
+        - document_ids: np.ndarray of shape (max_length,) where 1 = real token, 0 = padding
+    """
+    for seq in token_iterator:
+        # Convert to numpy if needed
+        if isinstance(seq, list):
+            seq = np.array(seq, dtype=np.int32)
+        elif isinstance(seq, jnp.ndarray):
+            seq = np.array(seq, dtype=np.int32)
+        elif seq.dtype != np.int32:
+            seq = seq.astype(np.int32)
+
+        if len(seq) == 0:
+            continue
+
+        if truncate:
+            # Simple truncation mode: yield one sequence per input
+            tokens = np.full((max_length,), pad_token_id, dtype=np.int32)
+            document_ids = np.zeros((max_length,), dtype=np.int32)
+
+            actual_len = min(len(seq), max_length)
+            tokens[:actual_len] = seq[:actual_len]
+            document_ids[:actual_len] = 1
+
+            yield tokens, document_ids
+        else:
+            # Split mode: yield multiple chunks for long sequences
+            for start in range(0, len(seq), max_length):
+                chunk = seq[start:start + max_length]
+
+                tokens = np.full((max_length,), pad_token_id, dtype=np.int32)
+                document_ids = np.zeros((max_length,), dtype=np.int32)
+
+                tokens[:len(chunk)] = chunk
+                document_ids[:len(chunk)] = 1
+
+                yield tokens, document_ids
 
 
 def pack_documents(
