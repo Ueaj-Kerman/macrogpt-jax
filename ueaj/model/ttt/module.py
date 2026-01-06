@@ -14,15 +14,16 @@ from .impl import ttt
 
 @config
 class TTTModel(nnx.Module):
-	"""Test-Time Training layer that learns to adapt its hidden state during inference.
+	"""Test-Time Training layer with multi-query support.
 
 	The TTT layer maintains a hidden state that is updated at each sequence position
-	using gradient descent on a self-supervised objective. The state is used to
-	produce outputs via an inner learnable module.
+	using gradient descent on a self-supervised objective. Multiple query heads can
+	share the same K/V state via the q_heads parameter.
 
 	Args:
 		model_d: Model dimension (input/output dimension)
 		hidden_d: Hidden dimension for the state (defaults to model_d)
+		q_heads: Number of query heads (multiquery uses shared k/v)
 		module: Inner module class to use as fwd_fn (default: GMLP)
 		module_kwargs: Additional kwargs to pass to the inner module
 		param_dtype: Parameter dtype
@@ -38,6 +39,7 @@ class TTTModel(nnx.Module):
 		self,
 		model_d: int,
 		hidden_d: int | None = None,
+		q_heads: int = 1,
 		module: Callable = GMLP,
 		module_kwargs: dict | None = None,
 		param_dtype: jnp.dtype = jnp.bfloat16,
@@ -55,19 +57,41 @@ class TTTModel(nnx.Module):
 		if hidden_d is None:
 			hidden_d = model_d
 
+		if q_heads < 1:
+			raise ValueError("q_heads must be >= 1")
+
 		if module_kwargs is None:
 			module_kwargs = {}
 
 		self.model_d = model_d
 		self.hidden_d = hidden_d
+		self.q_heads = q_heads
 		self.surrogate = surrogate
 
-		# Create fused k, v, q projection
-		size_dict = {'d': model_d, 'h': hidden_d, 'i': 3}
-		self.kvq_proj = Einsum(
-			"bnd,idh->ibnh",
-			size_dict=size_dict,
-			batch_dims="i",
+		# Create k, v projections (shared across q heads)
+		size_dict_kv = {'d': model_d, 'h': hidden_d}
+		self.k_proj = Einsum(
+			"bnd,dh->bnh",
+			size_dict=size_dict_kv,
+			rngs=rngs,
+			dtype=param_dtype,
+			mesh=mesh,
+			sharding=(None, 'tensor') if mesh is not None else None
+		)
+		self.v_proj = Einsum(
+			"bnd,dh->bnh",
+			size_dict=size_dict_kv,
+			rngs=rngs,
+			dtype=param_dtype,
+			mesh=mesh,
+			sharding=(None, 'tensor') if mesh is not None else None
+		)
+
+		# Q projection with q_heads dimension
+		size_dict_q = {'d': model_d, 'h': hidden_d, 'i': q_heads}
+		self.q_proj = Einsum(
+			"bnd,dih->bnih",
+			size_dict=size_dict_q,
 			rngs=rngs,
 			dtype=param_dtype,
 			mesh=mesh,
@@ -75,7 +99,6 @@ class TTTModel(nnx.Module):
 		)
 
 		# Create inner module - its parameters will be the TTT state
-		# This module takes (batch, seq, hidden_d) input and produces (batch, seq, hidden_d) output
 		self.inner_module = module(
 			model_d=hidden_d,
 			rngs=rngs,
@@ -87,16 +110,15 @@ class TTTModel(nnx.Module):
 		# RMSNorm after TTT, before output projection
 		self.norm = RMSNorm(hidden_d, rngs=rngs, mesh=mesh)
 
-		# Output projection to map from hidden_d back to model_d
-		size_dict_out = {'d': model_d, 'h': hidden_d}
+		# Output projection combines q_heads
+		size_dict_out = {'d': model_d, 'h': hidden_d, 'i': q_heads}
 		self.out_proj = Einsum(
-			"bnh,hd->bnd",
+			"bnih,ihd->bnd",
 			size_dict=size_dict_out,
-			# initializer=zeros_init,
 			rngs=rngs,
 			dtype=param_dtype,
 			mesh=mesh,
-			sharding=('tensor', None) if mesh is not None else None
+			sharding=(None, 'tensor', None) if mesh is not None else None
 		)
 
 		# Create the TTT forward function
@@ -115,20 +137,26 @@ class TTTModel(nnx.Module):
 
 		Args:
 			module_state: NNX State containing the module's parameters (this is the TTT state)
-			x: Input of shape (batch, hidden_d)
+			x: Input of shape (hidden_d,) or (q_heads, hidden_d)
 
 		Returns:
-			Output of shape (batch, hidden_d)
+			Output of shape (hidden_d,) or (q_heads, hidden_d)
 		"""
-		# Reconstruct the module from graph definition and state
 		module = nnx.merge(self.inner_module_gdef, module_state)
 
-		# Apply inner module
-		# Add dummy sequence dimension since modules expect (batch, seq, d)
-		x = x[None, None, ...]  # (batch, 1, hidden_d)
-		x = module(x)
-		x = x[0, 0]  # Remove sequence dimension -> (batch, hidden_d)
-		return x
+		# Handle both single-query and multi-query cases
+		if x.ndim == 1:
+			# Single query: (hidden_d,) -> add batch and seq dims
+			x = x[None, None, ...]  # (1, 1, hidden_d)
+			x = module(x)
+			return x[0, 0]
+		elif x.ndim == 2:
+			# Multi-query: (q_heads, hidden_d) -> treat q_heads as batch
+			x = x[:, None, ...]  # (q_heads, 1, hidden_d)
+			x = module(x)
+			return x[:, 0]
+		else:
+			raise ValueError(f"Unsupported input rank for TTT fwd: {x.shape}")
 
 	def __call__(self, x: jax.Array) -> jax.Array:
 		"""Apply TTT layer.
@@ -140,10 +168,13 @@ class TTTModel(nnx.Module):
 			Output of shape (batch, seq_len, model_d)
 		"""
 		# Project input to k, v, q
-		k, v, q = self.kvq_proj(x)  # Each: (batch, seq_len, hidden_d)
+		k = self.k_proj(x)  # (batch, seq_len, hidden_d)
+		v = self.v_proj(x)  # (batch, seq_len, hidden_d)
+		q = self.q_proj(x)  # (batch, seq_len, q_heads, hidden_d)
 
-		# Apply TTT algorithm - returns (output, final_state)
+		# Apply TTT algorithm
 		hidden, final_state = self.ttt_fn(k, v, q, nnx.state(self.inner_module))
+		# hidden: (batch, seq_len, q_heads, hidden_d)
 
 		# Normalize and project back to model dimension
 		hidden = self.norm(hidden)
@@ -152,6 +183,11 @@ class TTTModel(nnx.Module):
 
 	def apply_ttt(self, k, v, q):
 		"""Apply TTT algorithm directly on k, v, q.
+
+		Args:
+			k: (batch, seq_len, hidden_d)
+			v: (batch, seq_len, hidden_d)
+			q: (batch, seq_len, q_heads, hidden_d)
 
 		Returns:
 			(hidden_output, final_state) tuple
