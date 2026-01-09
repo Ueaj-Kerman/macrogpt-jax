@@ -88,6 +88,9 @@ def ttt(fwd_fn, surrogate=True, n_iters=1, wd=.1, lr=.005, block_size=None):
 	if not surrogate:
 		return jax.vmap(_ttt, in_axes=(0, 0, 0, None))
 
+	# Reference to single-token scan function (before any blocking wrappers)
+	fwd_scan_single = make_scan_fn(fwd_fn, n_iters, wd, lr)
+
 	def _ttt_bwd(res, g):
 		do, d_final_state = g  # Unpack cotangent tuple
 		k, v, q, init_state, final_state = res
@@ -96,14 +99,18 @@ def ttt(fwd_fn, surrogate=True, n_iters=1, wd=.1, lr=.005, block_size=None):
 
 		# ==========================================
 		# PASS 1: Forward through sequence, accumulating dState sum in fp32
-		# Start with d_final_state (gradient from next block) and accumulate
+		# Computes dstate_i = d(output_i)/d(state_i) for each token.
 		# ==========================================
-		def pass1_scan(carry, x):
+		def pass1_token_scan(carry, x):
+			"""Accumulate dstate for a single token."""
 			state, dstate_accum = carry
-			k, v, q, do = x
+			ki, vi, qi, doi = x
 
-			_, state_vjp_fn, state = jax.vjp(lambda s: tuple(reversed(fwd_scan(s, (k, v, q)))), state, has_aux=True)
-			dstate, = state_vjp_fn(do)
+			_, state_vjp_fn, state = jax.vjp(
+				lambda s: tuple(reversed(fwd_scan_single(s, (ki, vi, qi)))),
+				state, has_aux=True
+			)
+			dstate, = state_vjp_fn(doi)
 
 			dstate_accum = jax.tree.map(
 				lambda acc, ds: acc + ds,
@@ -114,35 +121,116 @@ def ttt(fwd_fn, surrogate=True, n_iters=1, wd=.1, lr=.005, block_size=None):
 		# Initialize with d_final_state (gradient flowing from next block)
 		init_accum = jax.tree.map(lambda x: x.astype(jnp.float32), d_final_state)
 		(_, total_dstate), _ = jax.lax.scan(
-			pass1_scan, (init_state, init_accum), reshape((k, v, q, do))
+			pass1_token_scan, (init_state, init_accum), (k, v, q, do)
 		)
 
 		# ==========================================
-		# PASS 2: Forward through sequence again, distribute gradients to k/v
+		# PASS 2: Distribute gradients to k/v with EXACT direct + SURROGATE indirect
+		#
+		# For token i, the gradient has two components:
+		# 1. DIRECT: output_i → k_i (single-step, computed exactly)
+		# 2. INDIRECT: output_j → k_i for j > i (multi-step, surrogate approx)
+		#
+		# Key insight: Direct path should NOT go through the extra J_upd factor
+		# that the surrogate dstate accumulation introduces.
 		# ==========================================
-		def pass2_scan(carry, x):
-			state, accum_dstate = carry
-			k, v, q, do = x
 
-			new_state, update_vjp_fn = jax.vjp(lambda s, k, v: update_fn(s, k, v), state, k, v)
-			accum_dstate_native = jax.tree.map(lambda x: x.astype(native_dtype), accum_dstate)
-			dstate_in, dk, dv = update_vjp_fn(accum_dstate_native)
-
-			_, state_vjp_fn = jax.vjp(lambda s, q: fwd_scan(s, (k, v, q))[1], state, q)
-			dstate_this, dq = state_vjp_fn(do)
-
-			new_accum_dstate = jax.tree.map(
-				lambda acc, ds: acc - ds.astype(jnp.float32),
-				accum_dstate, dstate_this
+		# Token-by-token surrogate VJP (for block_size=None case)
+		def compute_kvq_grads_surrogate(si, ki, vi, qi, doi, accum_i):
+			"""Single VJP that combines direct (from do) and indirect (from accum) gradients."""
+			accum_native = jax.tree.map(lambda x: x.astype(native_dtype), accum_i)
+			_, scan_vjp = jax.vjp(
+				lambda s, k, v, q: fwd_scan_single(s, (k, v, q)), si, ki, vi, qi
 			)
+			_, dk, dv, dq = scan_vjp((accum_native, doi))
+			return dk, dv, dq
 
-			return (new_state, new_accum_dstate), (dk, dv, dq)
+		if block_size is None:
+			# No blocking: process all tokens sequentially with surrogate
+			def pass2_token_scan(carry, x):
+				"""Compute combined gradients via single VJP."""
+				state, accum_indirect = carry
+				ki, vi, qi, doi = x
 
-		(_, _), (dk, dv, dq) = jax.lax.scan(
-			pass2_scan,
-			(init_state, total_dstate),
-			reshape((k, v, q, do))
-		)
+				dk, dv, dq = compute_kvq_grads_surrogate(state, ki, vi, qi, doi, accum_indirect)
+
+				new_state = update_fn_ref(state, ki, vi)
+				_, state_vjp_fn = jax.vjp(
+					lambda s: fwd_fn(update_fn_ref(s, ki, vi), qi), state
+				)
+				dstate_this, = state_vjp_fn(doi)
+				new_accum_indirect = jax.tree.map(
+					lambda acc, ds: acc - ds.astype(jnp.float32),
+					accum_indirect, dstate_this
+				)
+
+				return (new_state, new_accum_indirect), (dk, dv, dq)
+
+			(_, _), (dk, dv, dq) = jax.lax.scan(
+				pass2_token_scan,
+				(init_state, total_dstate),
+				(k, v, q, do)
+			)
+		else:
+			# With blocking: EXACT within-block gradients + SURROGATE inter-block
+			def pass2_block_exact(carry, x):
+				"""Process block with exact within-block gradients.
+
+				Key insight: Use standard VJP through the entire block for exact
+				within-block gradients. Only use surrogate for d_state propagation
+				between blocks.
+
+				IMPORTANT: The inter-block accumulator must EXCLUDE this block's
+				contribution before we use it. Otherwise we double-count within-block
+				gradients (once via exact VJP, once via surrogate accumulator).
+				"""
+				state, accum_inter_block = carry
+				k_block, v_block, q_block, do_block = x
+
+				# First, compute this block's dstate contribution (for accumulator update)
+				def compute_dstate(si, ki, vi, qi, doi):
+					_, state_vjp = jax.vjp(
+						lambda s: fwd_fn(update_fn_ref(s, ki, vi), qi), si
+					)
+					dstate_i, = state_vjp(doi)
+					return dstate_i
+
+				def collect_states(s, kv):
+					ki, vi = kv
+					new_s = update_fn_ref(s, ki, vi)
+					return new_s, s
+
+				final_state, states = jax.lax.scan(collect_states, state, (k_block, v_block))
+				dstates = jax.vmap(compute_dstate)(states, k_block, v_block, q_block, do_block)
+
+				# Subtract this block's contribution BEFORE using the accumulator
+				total_dstate_block = jax.tree.map(
+					lambda ds: ds.astype(jnp.float32).sum(axis=0), dstates
+				)
+				accum_future_only = jax.tree.map(
+					lambda acc, ds: acc - ds,
+					accum_inter_block, total_dstate_block
+				)
+
+				# VJP of entire block forward pass (gives EXACT within-block gradients)
+				def block_forward(s, k, v, q):
+					return jax.lax.scan(fwd_scan_single, s, (k, v, q))
+
+				_, block_vjp = jax.vjp(
+					block_forward, state, k_block, v_block, q_block
+				)
+
+				# Cotangent: (d_final_state from FUTURE blocks only, d_outputs)
+				accum_native = jax.tree.map(lambda x: x.astype(native_dtype), accum_future_only)
+				_, dk_block, dv_block, dq_block = block_vjp((accum_native, do_block))
+
+				return (final_state, accum_future_only), (dk_block, dv_block, dq_block)
+
+			(_, _), (dk, dv, dq) = jax.lax.scan(
+				pass2_block_exact,
+				(init_state, total_dstate),
+				reshape((k, v, q, do))
+			)
 
 		dk, dv, dq = unshape((dk, dv, dq))
 
