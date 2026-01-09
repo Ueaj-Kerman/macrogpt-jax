@@ -30,7 +30,7 @@ class TTTModel(nnx.Module):
 		surrogate: Whether to use surrogate gradients (custom VJP) for backprop
 		n_iters: Number of gradient descent iterations per token
 		wd: Weight decay coefficient for state updates
-		lr: Learning rate for state updates
+		lr: Learning rate for state updates (if None, uses muP scaling: 0.005 * sqrt(hidden_d/768))
 		block_size: If set, process tokens in blocks of this size (reduces memory)
 		rngs: Random number generators
 		mesh: Optional JAX mesh for distributed training
@@ -45,8 +45,8 @@ class TTTModel(nnx.Module):
 		param_dtype: jnp.dtype = jnp.bfloat16,
 		surrogate: bool = True,
 		n_iters: int = 1,
-		wd: float = 0.1,
-		lr: float = 0.005,
+		wd: float = 0.01,
+		lr: float = 0.01,
 		block_size: int | None = None,
 		*,
 		rngs: rng.Rngs,
@@ -56,6 +56,10 @@ class TTTModel(nnx.Module):
 
 		if hidden_d is None:
 			hidden_d = model_d
+
+		# muP scaling: lr scales as sqrt(hidden_d / base_dim)
+		# Base lr=0.005 was tuned for hidden_d=768
+		lr = lr * (hidden_d / 768) ** 0.5
 
 		if q_heads < 1:
 			raise ValueError("q_heads must be >= 1")
@@ -158,7 +162,7 @@ class TTTModel(nnx.Module):
 		else:
 			raise ValueError(f"Unsupported input rank for TTT fwd: {x.shape}")
 
-	def __call__(self, x: jax.Array) -> jax.Array:
+	def __call__(self, x: jax.Array, **_) -> jax.Array:
 		"""Apply TTT layer.
 
 		Args:

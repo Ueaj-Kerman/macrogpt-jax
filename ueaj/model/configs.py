@@ -72,11 +72,40 @@ def ueaj_model(vocab_size: int, model_d: int, num_layers: int, kq_ratio: int = 1
 	)
 
 
+def ueaj_ttt_model(vocab_size: int, model_d: int, num_layers: int, q_heads: int = 4, hidden_d: int = 256):
+	"""Create UEAJ model with TTT instead of attention."""
+	from ueaj.model import TransformerLayer, LlamaModel
+	from ueaj.model.ttt import TTTModel
+	from ueaj.model import MLP
+
+	return LlamaModel.override(
+		vocab_size=vocab_size,
+		model_d=model_d,
+		num_layers=num_layers,
+		transformer_layer=TransformerLayer.override(
+			attn=TTTModel.override(
+				q_heads=q_heads,
+				hidden_d=hidden_d,
+				# lr uses muP scaling automatically when None
+				surrogate=True,
+				n_iters=1,
+				block_size=16,
+			),
+			mlp=MLP.override(
+				act_fn=relu_squared,
+			),
+		)
+	)
+
+
 # Type annotations to help IDEs
 UEAJ_NH = ueaj_model(50432, 768, 1)
 UEAJ_150M = ueaj_model(50432, 768, 12)
 UEAJ_1B = ueaj_model(50432, 1536, 32, kq_ratio=2)
 UEAJ_3B = ueaj_model(50432, 2048, 48, kq_ratio=4, kq_d=256)
+
+# TTT variants
+UEAJ_150M_TTT = ueaj_ttt_model(50432, 768, 12, q_heads=4, hidden_d=256)
 
 if __name__ == "__main__":
 	print(f"UEAJ-150M has {format_param_count(count_parameters(UEAJ_150M))} parameters")

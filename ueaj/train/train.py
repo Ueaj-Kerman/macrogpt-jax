@@ -34,8 +34,8 @@ tokens_struct = jax.ShapeDtypeStruct((batch_size, seq_len), jax.numpy.int32)
 document_ids_struct = jax.ShapeDtypeStruct((batch_size, seq_len), jax.numpy.int32)
 
 print("Loading model...")
-# Use the default UEAJ configuration
-model = configs.UEAJ_150M(rngs=rng.Rngs(0))
+# Use the TTT configuration
+model = configs.UEAJ_150M_TTT(rngs=rng.Rngs(0))
 
 graph_def, state = nnx.split(model, nnx.Param)
 
@@ -81,6 +81,7 @@ dataset = datasets.load_dataset(
 )
 
 # Use the new prepare_dataset function
+# use_packing=False for TTT (no document boundary masking needed)
 print("Setting up train iterator...")
 dataset, (_, _) = data.prepare_dataset(
 	dataset,
@@ -88,6 +89,8 @@ dataset, (_, _) = data.prepare_dataset(
 	batch_size=batch_size,
 	seq_len=seq_len,
 	pad_token_id=pad_token,
+	use_packing=False,
+	truncate=False,  # Split long docs into chunks instead of truncating
 	buffer_size=32
 )
 
