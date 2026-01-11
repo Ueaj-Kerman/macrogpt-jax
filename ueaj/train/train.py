@@ -3,6 +3,7 @@ import os
 os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
 os.environ["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"] = "1"  # Required for kvax
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=".95"
+
 import wandb
 import gc
 import time
@@ -20,7 +21,8 @@ from ueaj.model import configs
 from ueaj.train import (training_utils, optimizer_setup, logging_utils)
 
 # batch_size, seq_len = 5, 4096
-batch_size, seq_len = 1, 6*8192
+# batch_size, seq_len = 1, 6*8192  # Too long for TTT
+batch_size, seq_len = 1, 1024  # Reduced for TTT memory
 pad_token = 50431
 
 print("Loading tokenizer...")
@@ -40,7 +42,7 @@ model = configs.UEAJ_150M_TTT(rngs=rng.Rngs(0))
 graph_def, state = nnx.split(model, nnx.Param)
 
 print(f"Initializing optimizer {optimizer_setup.get_optimizer_name()}...")
-base_lr = float(os.environ.get("BASE_LR", 0.025))
+base_lr = float(os.environ.get("BASE_LR", 0.0125))
 print(f"Using base learning rate: {base_lr}")
 opt_arg_0 = {'lr': jnp.array(base_lr), 'warmup': jnp.array(1.)}
 # Convert params to fp32 for optimizer (master weights)
@@ -98,7 +100,7 @@ print("Fetching test set...")
 test_tokens, test_doc_ids = next(dataset)
 dataset.send(None)
 
-warmup_tokens 		=   	10_000_000
+warmup_tokens 		=   	0
 cooldown_tokens 	=	   100_000_000
 max_train_tokens	=	10_000_000_000
 
@@ -116,7 +118,7 @@ for i, batch in enumerate(dataset):
 
 	# Run training
 	train_fn = train_step_stats if i % 25 == 0 else train_step_fast
-	warmup = min(trained_tokens / warmup_tokens, 1.)
+	warmup = min(trained_tokens / warmup_tokens, 1.) if warmup_tokens > 0 else 1.
 
 	opt_arg = {'lr': jnp.array(base_lr * warmup), 'warmup': warmup}
 	tokens, doc_ids = batch

@@ -112,7 +112,7 @@ class TTTModel(nnx.Module):
 		)
 
 		# RMSNorm after TTT, before output projection
-		self.norm = RMSNorm(hidden_d, rngs=rngs, mesh=mesh)
+		self.norm = RMSNorm(hidden_d, rngs=rngs, mesh=mesh, scale_mode='none')
 
 		# Output projection combines q_heads
 		size_dict_out = {'d': model_d, 'h': hidden_d, 'i': q_heads}
@@ -122,7 +122,8 @@ class TTTModel(nnx.Module):
 			rngs=rngs,
 			dtype=param_dtype,
 			mesh=mesh,
-			sharding=(None, 'tensor', None) if mesh is not None else None
+			sharding=(None, 'tensor', None) if mesh is not None else None,
+			initializer=zeros_init
 		)
 
 		# Create the TTT forward function
@@ -172,9 +173,10 @@ class TTTModel(nnx.Module):
 			Output of shape (batch, seq_len, model_d)
 		"""
 		# Project input to k, v, q
-		k = self.k_proj(x)  # (batch, seq_len, hidden_d)
-		v = self.v_proj(x)  # (batch, seq_len, hidden_d)
-		q = self.q_proj(x)  # (batch, seq_len, q_heads, hidden_d)
+		k = self.norm(self.k_proj(x))  # (batch, seq_len, hidden_d)
+		v = self.norm(self.v_proj(x))  # (batch, seq_len, hidden_d)
+		q = self.norm(self.q_proj(x))  # (batch, seq_len, q_heads, hidden_d)
+
 
 		# Apply TTT algorithm
 		hidden, final_state = self.ttt_fn(k, v, q, nnx.state(self.inner_module))

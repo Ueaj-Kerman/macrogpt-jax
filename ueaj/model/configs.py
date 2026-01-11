@@ -90,6 +90,7 @@ def ueaj_ttt_model(vocab_size: int, model_d: int, num_layers: int, q_heads: int 
 				surrogate=True,
 				n_iters=1,
 				block_size=16,
+				lr=.005
 			),
 			mlp=MLP.override(
 				act_fn=relu_squared,
@@ -105,7 +106,7 @@ UEAJ_1B = ueaj_model(50432, 1536, 32, kq_ratio=2)
 UEAJ_3B = ueaj_model(50432, 2048, 48, kq_ratio=4, kq_d=256)
 
 # TTT variants
-UEAJ_150M_TTT = ueaj_ttt_model(50432, 768, 12, q_heads=4, hidden_d=256)
+UEAJ_150M_TTT = ueaj_ttt_model(50432, 768, 12, q_heads=4, hidden_d=512)
 
 if __name__ == "__main__":
 	print(f"UEAJ-150M has {format_param_count(count_parameters(UEAJ_150M))} parameters")
