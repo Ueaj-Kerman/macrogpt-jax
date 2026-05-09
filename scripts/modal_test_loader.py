@@ -197,7 +197,7 @@ def run_loader_test(
 	import transformers
 	from jax.sharding import Mesh
 
-	from ueaj.train.dist_init import maybe_init_distributed
+	from ueaj.dist_init import maybe_init_distributed
 	from ueaj.data.distributed_loader import (
 		distributed_batch_iterator,
 		compute_host_loader_slots,

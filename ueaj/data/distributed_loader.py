@@ -60,6 +60,39 @@ def _device_mesh_coords(mesh: Mesh) -> dict:
 	return coords
 
 
+def _slots_from_coords(
+	axis_names: Sequence[str],
+	axis_sizes: Sequence[int],
+	data_axes: Sequence[str],
+	host_device_coords: Sequence[Tuple[int, ...]],
+) -> Tuple[list[int], int, int]:
+	"""Pure spec implementation.
+
+	Given the mesh's axis layout and the coords of devices owned by this host,
+	return ``(sorted_unique_data_ranks, num_loader_slots, total_data_world)``.
+
+	A device is a loader slot iff its coord is 0 along every non-data axis.
+	The data-rank is the row-major linearisation of its coords on ``data_axes``
+	(in the order given). Slots that share a data-rank dedupe down to one rank
+	(unique set), but ``num_loader_slots`` counts the underlying devices so the
+	caller can size per-host scratch buffers if needed.
+	"""
+	axis_pos = {a: i for i, a in enumerate(axis_names)}
+	non_data_axes = [a for a in axis_names if a not in data_axes]
+	data_shape = [axis_sizes[axis_pos[a]] for a in data_axes]
+	total = int(np.prod(data_shape)) if data_shape else 1
+
+	ranks: list[int] = []
+	for coord in host_device_coords:
+		if all(coord[axis_pos[a]] == 0 for a in non_data_axes):
+			rank = 0
+			for a, s in zip(data_axes, data_shape):
+				rank = rank * s + coord[axis_pos[a]]
+			ranks.append(rank)
+
+	return sorted(set(ranks)), len(ranks), total
+
+
 def compute_host_loader_slots(
 	mesh: Mesh,
 	data_axes: Sequence[str],
@@ -72,33 +105,15 @@ def compute_host_loader_slots(
 	     total_data_world_size)
 	"""
 	axis_names = list(mesh.shape.keys())
-	non_data_axes = [a for a in axis_names if a not in data_axes]
-	data_axes_set = set(data_axes)
-
-	axis_pos = {a: i for i, a in enumerate(axis_names)}
-	data_shape = [mesh.shape[a] for a in data_axes]
-	total_data_size = int(np.prod(data_shape)) if data_shape else 1
-
+	axis_sizes = [mesh.shape[a] for a in axis_names]
 	device_coords = _device_mesh_coords(mesh)
 	this_pid = jax.process_index()
-
-	loader_data_ranks: list[int] = []
-	for dev in jax.local_devices():
-		# Only this host's devices.
-		if dev.process_index != this_pid:
-			continue
-		coord = device_coords[dev.id]
-		# Loader slot: 0 along every non-data axis.
-		if all(coord[axis_pos[a]] == 0 for a in non_data_axes):
-			# Linearize the data coords (row-major over data_axes order).
-			data_coord = tuple(coord[axis_pos[a]] for a in data_axes)
-			rank = 0
-			for c, s in zip(data_coord, data_shape):
-				rank = rank * s + c
-			loader_data_ranks.append(rank)
-
-	loader_data_ranks_unique = sorted(set(loader_data_ranks))
-	return loader_data_ranks_unique, len(loader_data_ranks), total_data_size
+	host_coords = [
+		device_coords[d.id]
+		for d in jax.local_devices()
+		if d.process_index == this_pid
+	]
+	return _slots_from_coords(axis_names, axis_sizes, data_axes, host_coords)
 
 
 # ---------------------------------------------------------------------------
