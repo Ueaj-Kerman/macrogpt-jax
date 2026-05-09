@@ -46,6 +46,13 @@ def device_prefetch(
 	device = device or jax.devices()[0]
 	load_shard = None
 	if isinstance(device, jax.sharding.Mesh):
+		# NOTE: this multi-host branch is buggy and not currently used.
+		# - load_shard partitions on 'batch' but the load mesh axis is 'data'
+		#   (name mismatch -> NamedSharding error at runtime).
+		# - the upstream iterator is not sequence-sharded, so the
+		#   PartitionSpec('data', 'sequence') reshard is incorrect.
+		# Use ueaj.data.distributed_loader.distributed_batch_iterator instead
+		# for properly sharded multi-host loading.
 		load_mesh = jax.make_mesh((jax.device_count(),), ('data',))
 		load_shard = jax.NamedSharding(load_mesh, jax.sharding.PartitionSpec('batch'))
 		reshard = jax.NamedSharding(device, jax.sharding.PartitionSpec('data', 'sequence'))

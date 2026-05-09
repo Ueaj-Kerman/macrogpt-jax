@@ -24,17 +24,20 @@ import transformers
 from ueaj import data
 from ueaj.model import configs
 from ueaj.train import (training_utils, optimizer_setup, logging_utils)
+from ueaj.utils.sol import cost_of_compiled, format_line as sol_format_line, report as sol_report
 
 # batch_size, seq_len = 5, 4096
 batch_size, seq_len = 1, 8192
-pad_token = 50431
 
 print("Loading tokenizer...")
-# tokenizer = transformers.PreTrainedTokenizerFast.from_pretrained("meta-llama/Meta-Llama-3-8B")
-tokenizer = transformers.GPT2TokenizerFast.from_pretrained("openai-community/gpt2")
-# Set model_max_length properly - this is the attribute that actually controls the warning
-tokenizer.model_max_length = seq_len  # Set to 4096
-print("Vocab Size:", tokenizer.vocab_size)
+tokenizer = transformers.AutoTokenizer.from_pretrained("moondream/starmie-v1")
+tokenizer.model_max_length = seq_len
+# len(tokenizer) covers base vocab + added/special tokens; embeddings need to span all of it.
+tokenizer_vocab = len(tokenizer)
+pad_token = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
+print(f"Vocab Size: {tokenizer_vocab}, pad_token_id: {pad_token}")
+
+model_config = configs.UEAJ_1B.override(vocab_size=tokenizer_vocab)
 
 # Create structure descriptors for compilation
 tokens_struct = jax.ShapeDtypeStruct((batch_size, seq_len), jax.numpy.int32)
@@ -57,7 +60,7 @@ with manager:
 
 	@jax.jit
 	def make_state():
-		model = configs.UEAJ_1B(rngs=rng.Rngs(0))
+		model = model_config(rngs=rng.Rngs(0))
 		graph_def, state = nnx.split(model, nnx.Param) # todo handle other categories
 		# Convert params to fp32 for optimizer (master weights)
 		state = jax.tree.map(lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x, state)
@@ -86,6 +89,10 @@ with manager:
 		document_ids_struct=document_ids_struct,
 		pad_token=pad_token,
 	)
+
+step_cost = cost_of_compiled(train_step_fast)
+if step_cost is not None:
+	print(f"Train step cost: {step_cost.flops*1e-12:.2f} TFLOPs, {step_cost.bytes_accessed*1e-9:.2f} GB accessed")
 
 run_name = os.environ.get("RUN_NAME")
 if run_name is None:
@@ -217,13 +224,17 @@ for i, batch in enumerate(dataset):
 		seq_len=seq_len,
 		run_name=run_name,
 		test_loss=test_stats,
+		step_cost=step_cost,
 	)
 
 	# Update trained_tokens from the logging function
 	trained_tokens = log_values['trained_tokens']
 
 	# Print basic info always
-	print(f"[{i}] Train loss: {log_values['mean_loss']:.2f}, Std loss: {log_values['std_loss']:.2f}, Tokens/s: {log_values['tokens_per_second']:.0f}, Tokens: {trained_tokens}, Train time: {train_time:.2f}s")
+	sol_str = ""
+	if step_cost is not None:
+		sol_str = " | " + sol_format_line(sol_report(step_cost, train_time))
+	print(f"[{i}] Train loss: {log_values['mean_loss']:.2f}, Std loss: {log_values['std_loss']:.2f}, Tokens/s: {log_values['tokens_per_second']:.0f}, Tokens: {trained_tokens}, Train time: {train_time:.2f}s{sol_str}")
 
 	if np.isnan(log_values['mean_loss']):
 		print("Loss is NaN, stopping training...")

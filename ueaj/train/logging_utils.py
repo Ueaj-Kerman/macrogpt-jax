@@ -7,6 +7,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from ueaj.utils.sol import StepCost, report as sol_report
+
 # Track whether wandb is enabled for this session
 _wandb_enabled = False
 
@@ -22,6 +24,7 @@ def log_training_metrics(
     seq_len: int,
     run_name: Optional[str],
     test_loss: Optional[Tuple[float, float]] = None,
+    step_cost: Optional[StepCost] = None,
 ) -> Dict[str, float]:
     """Log training metrics to wandb and return values for console logging.
 
@@ -52,6 +55,8 @@ def log_training_metrics(
     tokens_per_second = (batch_size * seq_len) / train_time
     trained_tokens += (batch_size * seq_len)
 
+    sol = sol_report(step_cost, train_time) if step_cost is not None else None
+
     # Initialize wandb on first call (only if run_name is provided and not a null-like value)
     if step == 0 and run_name is not None and run_name.lower() not in ('null', 'none', ''):
         import wandb
@@ -79,6 +84,11 @@ def log_training_metrics(
             wandb_dict["test_loss"] = float(test_mean)
             wandb_dict["test_loss_std"] = float(test_std)
 
+        if sol is not None:
+            for k in ("tflops_per_s", "hbm_gbps", "mfu", "mbu"):
+                if k in sol:
+                    wandb_dict[f"sol/{k}"] = float(sol[k])
+
         # Process and add all statistics from the stats dict
         for stat_name, stat_value in stats.items():
             if isinstance(stat_value, dict) or hasattr(stat_value, 'items'):
@@ -105,6 +115,13 @@ def log_training_metrics(
     if test_loss is not None:
         return_dict['test_mean'] = float(test_loss[0])
         return_dict['test_std'] = float(test_loss[1])
+
+    if sol is not None:
+        return_dict['tflops_per_s'] = float(sol['tflops_per_s'])
+        if 'mfu' in sol:
+            return_dict['mfu'] = float(sol['mfu'])
+        if 'mbu' in sol:
+            return_dict['mbu'] = float(sol['mbu'])
 
     return return_dict
 

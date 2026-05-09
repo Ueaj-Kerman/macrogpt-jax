@@ -38,20 +38,13 @@ def project_rms_rows(max_rms: float = 1.25) -> GradientTransformation:
 
 	Should be chained at the END of an optimizer (after learning rate scaling).
 	"""
-	def update_fn(updates, params):
-		# Compute what the new params would be after applying updates
-		new_val = params + updates
-
-		# Compute RMS per row (last axis = embedding dimension)
+	def project_one(u, p):
+		new_val = p + u
 		row_rms = jnp.sqrt(jnp.mean(jnp.square(new_val), axis=-1, keepdims=True))
-
-		# If RMS > max_rms, normalize to RMS=1; otherwise keep as-is
 		scale = jnp.where(row_rms > max_rms, row_rms, 1.0)
-
-		# Compute target params after projection
 		target = new_val / scale
+		return target - p
 
-		# Return the update that achieves params -> target
-		return target - params
-
-	return optax.stateless(update_fn)
+	return optax.stateless(
+		lambda updates, params: jax.tree.map(project_one, updates, params)
+	)

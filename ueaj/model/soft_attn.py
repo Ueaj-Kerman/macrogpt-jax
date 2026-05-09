@@ -9,7 +9,7 @@ import optax
 from flax import nnx
 from flax.nnx import rnglib as rng
 
-from kvax.ops.flash_attention_clean import flash_attention
+from ueaj.kernels import flash_attention
 
 from ueaj.model.einsum import *
 from ueaj.model import rope

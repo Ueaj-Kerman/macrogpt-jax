@@ -205,9 +205,7 @@ class LlamaModel(nnx.Module):
 		query_positions = kwargs.get('query_positions', kwargs['position_ids'])
 		kv_positions = kwargs.get('kv_positions', kwargs['position_ids'])
 
-		# Import kvax components using the new clean API
-		from kvax.ops.flash_attention_clean import create_attention_mask
-		from kvax.utils.common import FlashAttentionParamsConfig
+		from ueaj.kernels import create_attention_mask, FlashAttentionParamsConfig
 
 		# Create flash attention params
 		fwd_params = FlashAttentionParamsConfig(

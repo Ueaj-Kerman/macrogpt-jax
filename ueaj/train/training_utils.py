@@ -9,7 +9,7 @@ import optax
 from flax import nnx
 import safetensors.flax as st
 
-from kvax.utils import PADDING_SEGMENT_ID
+from ueaj.kernels import PADDING_SEGMENT_ID
 from ueaj.model import LlamaModel
 from ueaj.opt.next_token_loss import chunked_softmax_cross_entropy
 from ueaj.utils import tensor_stats
@@ -49,25 +49,26 @@ def test(
 	kwargs['query_segment_ids'] = segment_ids
 	kwargs['kv_segment_ids'] = segment_ids
 
-	# Note: The model.get_activations already handles kvax context internally
-	activations = model.get_activations(inputs, **kwargs)
+	with jax.named_scope("forward"):
+		activations = model.get_activations(inputs, **kwargs)
 
 	def logit_projection(hidden_states: jax.Array, g_def, params, etc) -> jax.Array:
 		"""Reconstruct a fresh module to keep RNG state from drifting under remat."""
 		model = nnx.merge(g_def, params, etc)
 		return model.get_logits(hidden_states)
 
-	token_loss, loss_mask = chunked_softmax_cross_entropy(
-		inputs,
-		activations,
-		logit_projection,
-		document_ids=document_ids,
-		pad_token_id=pad_token_id,
-		return_loss_mask=True,
-		g_def=g_def,
-		params=params,
-		etc=etc,
-	)
+	with jax.named_scope("loss"):
+		token_loss, loss_mask = chunked_softmax_cross_entropy(
+			inputs,
+			activations,
+			logit_projection,
+			document_ids=document_ids,
+			pad_token_id=pad_token_id,
+			return_loss_mask=True,
+			g_def=g_def,
+			params=params,
+			etc=etc,
+		)
 	count = loss_mask.sum(dtype=jnp.float32)
 
 	loss_val = token_loss.sum() / jnp.sqrt(count)
@@ -165,20 +166,20 @@ def train_step(
 		Tuple of (updated_state, updated_opt_state, statistics_dict)
 	"""
 	params, etc = nnx.split_state(state, nnx.Param, nnx.Not(nnx.Param))
-	# Cast params if needed for computation (e.g., to bfloat16)
-	casted_params = jax.tree.map(lambda p: p.astype(jnp.bfloat16) if p.dtype != jnp.bfloat16 else p, params)
+	with jax.named_scope("cast_params_bf16"):
+		casted_params = jax.tree.map(lambda p: p.astype(jnp.bfloat16) if p.dtype != jnp.bfloat16 else p, params)
 
-	dmodel, (mean_loss, std_loss) = jax.grad(test, has_aux=True, argnums=1)(
-		g_def,
-		casted_params,
-		etc,
-		inputs,
-		document_ids,
-		pad_token_id
-	)
+	with jax.named_scope("fwd_bwd"):
+		dmodel, (mean_loss, std_loss) = jax.grad(test, has_aux=True, argnums=1)(
+			g_def,
+			casted_params,
+			etc,
+			inputs,
+			document_ids,
+			pad_token_id
+		)
 
-	with jax.profiler.TraceAnnotation("update"):
-		# Update parameters
+	with jax.named_scope("optimizer_update"):
 		dmodel_updates, opt_state = opt(model=nnx.merge(g_def, params, etc), **opt_args).update(dmodel, opt_state,
 																								params)
 		new_params = optax.apply_updates(params, dmodel_updates)
@@ -188,10 +189,10 @@ def train_step(
 
 		state = nnx.merge_state(params, etc)
 
-	# Collect statistics
-	stats = collect_statistics(
-		params, dmodel, delta, opt_state, mean_loss, std_loss, stats_to_collect
-	)
+	with jax.named_scope("stats"):
+		stats = collect_statistics(
+			params, dmodel, delta, opt_state, mean_loss, std_loss, stats_to_collect
+		)
 
 	return state, opt_state, stats
 
