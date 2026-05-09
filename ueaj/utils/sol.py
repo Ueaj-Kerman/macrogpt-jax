@@ -54,6 +54,34 @@ class StepCost:
         return self.achieved_hbm_gbps(wall_time_s) / peak_gbps
 
 
+def analytical_step_cost(
+    num_params: int,
+    tokens_per_step: int,
+    *,
+    num_layers: Optional[int] = None,
+    num_query_heads: Optional[int] = None,
+    head_dim: Optional[int] = None,
+    bytes_per_param: int = 2,
+) -> StepCost:
+    """Analytical FLOP/byte estimate for one training step.
+
+    XLA's ``cost_analysis()`` undercounts in our setup -- it misses the
+    attention seq^2 term and the chunked-loss / remat recompute. This formula
+    is the standard transformer accounting that wandb dashboards use:
+
+        flops/step = 6 * P * tokens                       (fwd+bwd matmuls)
+                   + 12 * L * H * D * tokens^2            (attention QK^T + V, fwd+bwd)
+
+    The attention term is added only if all of (num_layers, num_query_heads,
+    head_dim) are provided. ``bytes_per_param=2`` assumes bf16 traffic.
+    """
+    flops = 6.0 * num_params * tokens_per_step
+    if num_layers and num_query_heads and head_dim:
+        flops += 12.0 * num_layers * num_query_heads * head_dim * (tokens_per_step ** 2)
+    bytes_accessed = float(bytes_per_param * num_params * 3)  # fwd read + bwd read + update write
+    return StepCost(flops=flops, bytes_accessed=bytes_accessed)
+
+
 def cost_of_compiled(compiled: Any) -> Optional[StepCost]:
     """Pull FLOPs and bytes_accessed from a compiled JAX function.
 

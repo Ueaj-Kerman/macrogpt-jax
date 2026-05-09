@@ -10,3 +10,4 @@ wandb/
 *.safetensors
 CLAUDE.md
 .claude/
+profiles/

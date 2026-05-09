@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "MacroGPT-JAX: configurable distributed pretraining on JAX/Flax"
 requires-python = ">=3.13,<3.14"
 dependencies = [
-    "jax[cuda12]>=0.8.1",
+    "jax[cuda13]>=0.10.0",
     "flax>=0.12.0",
     "optax>=0.2.6",
     "numpy>=2.3,<3",
@@ -15,8 +15,8 @@ dependencies = [
     "wandb>=0.23.0",
     "kvax @ https://ueaj.dev/python/kvax-0.1.2-py3-none-any.whl",
     "jax-triton @ git+https://github.com/jax-ml/jax-triton.git@48a0ff700ec539a3694982c7cacf8fd32595468b",
-    # triton 3.7 emits PTX 9.1 (CUDA 13 toolchain); we're on cuda12, so pin <3.7.
-    "triton>=3.6,<3.7",
+    # CUDA 13 toolchain ships ptxas for PTX 9.1, so we can pick up triton 3.7+.
+    "triton>=3.7",
 ]
 
 [project.optional-dependencies]

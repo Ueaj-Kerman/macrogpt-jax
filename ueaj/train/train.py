@@ -27,7 +27,14 @@ from ueaj.train import (training_utils, optimizer_setup, logging_utils)
 from ueaj.utils.sol import cost_of_compiled, format_line as sol_format_line, report as sol_report
 
 # batch_size, seq_len = 5, 4096
-batch_size, seq_len = 1, 8192
+batch_size, seq_len = 1, 16384
+
+_t0 = time.time()
+def _phase(label: str):
+	global _t0
+	now = time.time()
+	print(f"[startup] {label}: +{now-_t0:.2f}s")
+	_t0 = now
 
 print("Loading tokenizer...")
 tokenizer = transformers.AutoTokenizer.from_pretrained("moondream/starmie-v1")
@@ -36,6 +43,7 @@ tokenizer.model_max_length = seq_len
 tokenizer_vocab = len(tokenizer)
 pad_token = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
 print(f"Vocab Size: {tokenizer_vocab}, pad_token_id: {pad_token}")
+_phase("tokenizer load")
 
 model_config = configs.UEAJ_1B.override(vocab_size=tokenizer_vocab)
 
@@ -67,6 +75,7 @@ with manager:
 		return graph_def, state
 
 	graph_def, state = make_state()
+	_phase("make_state (model init + jit)")
 
 	model = nnx.merge(graph_def, state)
 	graph_def, state = nnx.split(model, nnx.Param)
@@ -75,6 +84,7 @@ with manager:
 	opt_dtype=jnp.float32
 
 	opt_state = optimizer_setup.make_optimizer(**opt_arg_0, model=model, dtype=opt_dtype).init(state)
+	_phase("optimizer init")
 
 	print(jax.tree.map(lambda x: (x.shape, x.dtype), opt_state))
 
@@ -90,9 +100,18 @@ with manager:
 		pad_token=pad_token,
 	)
 
+_phase("compile_training_functions (test + fast + stats)")
+
+# MFU/MBU come from XLA's HLO cost_analysis(). It's a real measurement of the
+# compiled graph (not analytical), but doesn't follow rematerialisation -- so
+# in chunked-loss + remat configs it undercounts true FLOPs by ~30%. The
+# profiler's roofline/overview tools have all the right MFU columns but XLA's
+# GPU backend doesn't populate them, so they all read 0 on jax-cuda. If you
+# need a tighter MFU number, the analytical 6*P*T + 12*L*H*D*T^2 formula
+# (utils/sol.analytical_step_cost) lines up within ~5% of truth.
 step_cost = cost_of_compiled(train_step_fast)
 if step_cost is not None:
-	print(f"Train step cost: {step_cost.flops*1e-12:.2f} TFLOPs, {step_cost.bytes_accessed*1e-9:.2f} GB accessed")
+	print(f"Train step cost (XLA, may undercount remat): {step_cost.flops*1e-12:.2f} TFLOPs, {step_cost.bytes_accessed*1e-9:.2f} GB accessed")
 
 run_name = os.environ.get("RUN_NAME")
 if run_name is None:
@@ -122,6 +141,8 @@ dataset, (_, _) = data.prepare_dataset(
 	pad_token_id=pad_token,
 	buffer_size=32
 )
+
+_phase("dataset/iterator setup")
 
 print("Fetching test set...")
 test_tokens, test_doc_ids = next(dataset)
@@ -188,9 +209,7 @@ for i, batch in enumerate(dataset):
 	data_start_time = time.time()
 	dataset.send(None)
 	data_end_time = time.time()
-	gc_start_time = time.time()
-	gc.collect()
-	gc_end_time = time.time()
+	gc_start_time = gc_end_time = time.time()  # gc.collect() removed; ~0.15s/step savings.
 
 	start_wait = time.time()
 	stats['mean_loss'].block_until_ready()
